@@ -1,0 +1,29 @@
+# ── Secrets / credentials — NEVER commit ─────────────────────────────────────
+.env
+session.json
+
+# ── Personal data (per-user; create from the *.example.* templates) ──────────
+data/*
+!data/.gitkeep
+!data/profile.example.json
+# Your real, filled base résumés (the *.example.tex templates stay tracked):
+resume_templates/Resume_SWE_General.tex
+resume_templates/Resume_AI-ML_General.tex
+resume_templates/memory.txt
+
+# ── Generated outputs (regenerated each run; personal) ───────────────────────
+documents/
+resumes/
+cover_letters/
+applications/
+analysis/
+logs/
+
+# ── launchd schedule files (machine-specific paths + username) ───────────────
+*.plist
+
+# ── Python / OS noise ────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
