@@ -45,16 +45,37 @@ def notify_telegram(text: str):
     except Exception:
         pass
 
-# API query params — mirrors the URL the user provided; postdate=1 = past 24 h
-# Change postdate to 7 (week) or 30 (month) for broader results
-API_PARAMS = (
-    "perPage=100&sort=!postdate&ocr=f"
-    "&job_type=5,17"
-    "&postdate=1"
-    "&targeted_academic_majors=0160"
-    "&exclude_applied_jobs=1"
-    "&json_mode=read_only&enable_translation=false"
-)
+# Output CSV columns (kept here so save_csv can write a header even for an empty
+# result — clearing stale rows when a scrape genuinely finds nothing).
+CSV_FIELDS = [
+    "job_id", "title", "company", "location", "type", "posted",
+    "deadline", "salary", "remote", "qualified", "apply_urls", "description",
+]
+
+
+class ScrapeError(RuntimeError):
+    """The jobs API could not be reached/parsed at all (network/session problem).
+    Distinct from a successful fetch that legitimately returns zero jobs — the
+    caller exits non-zero on this so the pipeline leaves the day UNMARKED and
+    retries, instead of silently keeping a stale jobs.csv (the 2026-06-25 bug)."""
+
+
+# Job-search filters. job_type=5,17 = co-op/internship; targeted_academic_majors
+# is the major code; exclude_applied_jobs drops anything already applied to.
+# `postdate` is the look-back window in days (1 = past 24h) — override on the CLI
+# with --postdate / --window-days N for a broader sweep.
+def _filters(postdate: int) -> str:
+    return ("&job_type=5,17"
+            f"&postdate={int(postdate)}"
+            "&targeted_academic_majors=0160"
+            "&exclude_applied_jobs=1")
+
+
+def search_url(postdate: int, page: int = 1, per_page: int = 100) -> str:
+    """Full job-search page URL. Navigating here makes the React app fire its own
+    authenticated, filtered jobs call — which scrape_all_jobs intercepts."""
+    return (f"{PORTAL_URL}?perPage={per_page}&page={page}&sort=!postdate&ocr=f"
+            + _filters(postdate))
 
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -242,86 +263,89 @@ async def ensure_logged_in(page, context, username: str, password: str):
     print(f"  ✓ Session saved → {SESSION_FILE}\n")
 
 
-# ── API scraping: intercept the React app's own authenticated calls ────────────
+# ── API scraping ──────────────────────────────────────────────────────────────
+# IMPORTANT: this jobs API only returns real results to the React app's OWN
+# request. A bare replayed fetch — even authenticated and on-origin — gets an
+# empty 200 (total=0), because the result set is tied to request context the app
+# establishes (a /api/v2/jobs/filters/students call + XHR headers). So the only
+# reliable path is to navigate to the FILTERED search page and INTERCEPT the
+# response the app fires for itself.
+#
+# Hardening over the original (which silently returned [] on a miss — the
+# 2026-06-25 empty scrape): we match OUR filtered call via its job_type signature
+# (so we never grab the app's unfiltered default 1400-job call), retry the
+# navigation on a miss, and RAISE ScrapeError when nothing is ever captured. That
+# last point is the key fix — a capture miss (mechanism failure) is now distinct
+# from a genuinely empty result, so the pipeline retries instead of marking the
+# day done off a stale jobs.csv.
 
-async def scrape_all_jobs(page) -> list[dict]:
-    """
-    Navigate to each page of the job search URL and intercept the API response
-    that the React app fires automatically — this carries all auth headers the
-    app adds and is guaranteed to work.
-    """
-    print("  Fetching jobs by intercepting React app API calls...")
+async def intercept_jobs_page(page, postdate: int, pg: int, per_page: int = 100,
+                              attempts: int = 3, timeout: int = 30) -> dict | None:
+    """Navigate to the filtered search page and capture the jobs API response the
+    React app fires. Returns the parsed body (even when it legitimately holds zero
+    jobs), or None if no matching response was captured after `attempts` tries."""
+    for attempt in range(1, attempts + 1):
+        data: dict = {}
+        got = asyncio.Event()
 
-    all_jobs: list[dict] = []
-    per_page = 100
-
-    # --- page 1: navigate and grab first response ---------------------------
-    first_data: dict = {}
-    got_first = asyncio.Event()
-
-    async def capture_first(response):
-        if "/api/v2/jobs?" in response.url and "json_mode=read_only" in response.url and response.status == 200:
-            try:
-                body = await response.json()
-                if isinstance(body, dict) and "models" in body:
-                    first_data.update(body)
-                    got_first.set()
-            except Exception:
-                pass
-
-    page.on("response", capture_first)
-    await page.goto(
-        f"{PORTAL_URL}?perPage={per_page}&page=1&sort=!postdate&ocr=f"
-        "&job_type=5,17&postdate=1&targeted_academic_majors=0160&exclude_applied_jobs=1",
-        wait_until="domcontentloaded",
-        timeout=30_000,
-    )
-    try:
-        await asyncio.wait_for(got_first.wait(), timeout=15)
-    except asyncio.TimeoutError:
-        pass
-    page.remove_listener("response", capture_first)
-
-    if not first_data:
-        print("  ⚠  API returned nothing — session may have expired.")
-        return []
-
-    total    = first_data.get("total", 0)
-    per_page = first_data.get("perPage", per_page)
-    pages    = max(1, -(-total // per_page))
-    all_jobs.extend(first_data.get("models", []))
-    print(f"  Found {total} jobs across {pages} page(s).")
-
-    # --- subsequent pages ---------------------------------------------------
-    for pg in range(2, pages + 1):
-        page_data: dict = {}
-        got_page = asyncio.Event()
-
-        async def capture_page(response, _pg=pg):
-            if (f"page={_pg}" in response.url and "/api/v2/jobs?" in response.url
-                    and "json_mode=read_only" in response.url and response.status == 200):
+        async def capture(response):
+            url = response.url
+            if ("/api/v2/jobs?" in url and "json_mode=read_only" in url
+                    and "job_type=5,17" in url and response.status == 200
+                    and (pg == 1 or f"page={pg}" in url)):
                 try:
                     body = await response.json()
                     if isinstance(body, dict) and "models" in body:
-                        page_data.update(body)
-                        got_page.set()
+                        data.update(body)
+                        got.set()
                 except Exception:
                     pass
 
-        page.on("response", capture_page)
-        await page.goto(
-            f"{PORTAL_URL}?perPage={per_page}&page={pg}&sort=!postdate&ocr=f"
-            "&job_type=5,17&postdate=1&targeted_academic_majors=0160&exclude_applied_jobs=1",
-            wait_until="domcontentloaded",
-            timeout=30_000,
-        )
+        page.on("response", capture)
         try:
-            await asyncio.wait_for(got_page.wait(), timeout=15)
+            await page.goto(search_url(postdate, pg, per_page),
+                            wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(got.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
-        page.remove_listener("response", capture_page)
+        page.remove_listener("response", capture)
+        if data:
+            return data
+        if attempt < attempts:
+            print(f"  ⚠  No jobs response captured (attempt {attempt}/{attempts}) — retrying...")
+            await asyncio.sleep(3)
+    return None
 
-        all_jobs.extend(page_data.get("models", []))
+
+async def scrape_all_jobs(page, postdate: int = 1) -> list[dict]:
+    """Fetch every page of the job-search results by intercepting the app's own
+    API calls. Raises ScrapeError if the data call is never captured (so the
+    caller exits non-zero and the pipeline retries rather than keeping a stale
+    jobs.csv). Returns [] ONLY when the fetch genuinely succeeds with zero jobs."""
+    print(f"  Fetching jobs (window: past {postdate} day(s))...")
+    per_page = 100
+
+    first = await intercept_jobs_page(page, postdate, 1, per_page)
+    if not first:
+        raise ScrapeError(
+            "could not capture the jobs API response after retries — the search "
+            "page never fired its data call (slow render / redirect / session "
+            "issue), NOT a confirmed-empty board")
+
+    total    = first.get("total", 0)
+    per_page = first.get("perPage", per_page)
+    pages    = max(1, -(-total // per_page))
+    all_jobs = list(first.get("models", []))
+    print(f"  Found {total} job(s) across {pages} page(s).")
+
+    # --- subsequent pages ---------------------------------------------------
+    for pg in range(2, pages + 1):
+        data = await intercept_jobs_page(page, postdate, pg, per_page)
+        if data:
+            all_jobs.extend(data.get("models", []))
         print(f"  Page {pg}/{pages}: {len(all_jobs)} total so far...")
 
     return all_jobs
@@ -395,20 +419,36 @@ def flatten(job: dict) -> dict:
 # ── Save CSV ──────────────────────────────────────────────────────────────────
 
 def save_csv(jobs: list[dict]):
-    if not jobs:
-        print("\n  ⚠  No jobs to save.")
-        return
-    fieldnames = list(jobs[0].keys())
+    """Write jobs.csv. ALWAYS writes a header — even for zero jobs — so a
+    genuinely empty (but successful) scrape clears stale rows from a prior run
+    instead of leaving them to be reprocessed. A failed fetch never reaches here
+    (it raises ScrapeError), so the old CSV is preserved in that case."""
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(jobs)
-    print(f"\n  ✓ {len(jobs)} jobs saved → {OUTPUT_FILE}")
+    if jobs:
+        print(f"\n  ✓ {len(jobs)} jobs saved → {OUTPUT_FILE}")
+    else:
+        print(f"\n  ✓ Scrape OK — 0 new jobs in the window; wrote empty {OUTPUT_FILE}.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main():
+def parse_window(argv) -> int:
+    """Look-back window in days. Default 1 (past 24h); override with
+    --postdate N / --window-days N / --days N for a broader sweep."""
+    for flag in ("--postdate", "--window-days", "--days"):
+        if flag in argv:
+            try:
+                return max(1, int(argv[argv.index(flag) + 1]))
+            except (ValueError, IndexError):
+                pass
+    return 1
+
+
+async def main(postdate: int = 1) -> int:
     username, password = load_credentials()
 
     print("  Launching browser...")
@@ -436,8 +476,17 @@ async def main():
 
         await ensure_logged_in(page, context, username, password)
 
-        raw_jobs = await scrape_all_jobs(page)
-        jobs     = [flatten(j) for j in raw_jobs]
+        try:
+            raw_jobs = await scrape_all_jobs(page, postdate)
+        except ScrapeError as e:
+            print(f"\n  ✗ Scrape failed: {e}")
+            notify_telegram("⚠️ NUworks scrape couldn't reach the jobs API "
+                            "(session/network). Day left unmarked — it'll retry "
+                            "on next login.")
+            await browser.close()
+            return 4  # non-zero → pipeline leaves the day unmarked and retries
+
+        jobs = [flatten(j) for j in raw_jobs]
         save_csv(jobs)
 
         # Print a quick preview
@@ -450,7 +499,8 @@ async def main():
 
         await browser.close()
         print("\n  Done.\n")
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main(parse_window(sys.argv[1:]))))
