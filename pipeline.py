@@ -184,15 +184,31 @@ def save_pending(items: list[dict]):
     PENDING_FILE.write_text(json.dumps(items, indent=2))
 
 
-def add_pending(job: dict):
+def add_pending(job: dict, failure_class: str = "transient", detail: str = ""):
+    """Upsert a job into the retry queue. First time: record it with _attempts=1 and
+    _first_queued. Subsequent times: increment _attempts and refresh the failure class,
+    detail and timestamp — the supervisor uses _attempts + _last_class to cap doomed
+    loops (a job that keeps failing the same structural way is evicted, not retried).
+    Backward-compatible: callers that pass no class re-queue as a plain transient."""
     items = load_pending()
-    if any(p.get("job_id") == job.get("job_id") for p in items):
-        return
-    # Keep the fields a later run needs to tailor + apply without re-scraping.
+    now = datetime.now().isoformat()
+    for p in items:
+        if p.get("job_id") == job.get("job_id"):
+            p["_attempts"] = int(p.get("_attempts", 0) or 0) + 1
+            p["_last_class"] = failure_class
+            p["_last_detail"] = (detail or "")[:300]
+            p["_queued_at"] = now
+            save_pending(items)
+            return
+    # First queue: keep the fields a later run needs to tailor + apply without re-scraping.
     keep = {k: job.get(k) for k in ("job_id", "title", "company", "location",
                                     "salary", "deadline", "description", "apply_urls",
                                     "_apply_type", "_required_docs")}
-    keep["_queued_at"] = datetime.now().isoformat()
+    keep["_queued_at"] = now
+    keep["_first_queued"] = now
+    keep["_attempts"] = 1
+    keep["_last_class"] = failure_class
+    keep["_last_detail"] = (detail or "")[:300]
     items.append(keep)
     save_pending(items)
 
@@ -482,6 +498,23 @@ def _alert_failure(job: dict, fail: dict):
         pass
 
 
+def _result(job: dict, status: str, detail: str = "", system_failure: bool = False,
+            extra: dict = None) -> dict:
+    """Uniform apply result. ALWAYS carries job_id (the supervisor keys eviction / age-out
+    / diagnosis by it) while keeping "job" as the title for the existing summary + the
+    stats.record_run code. Pass `extra` to attach extra fields (resume path, ext links)."""
+    r = {"job": (job.get("title", "") or "")[:55],
+         "job_id": str(job.get("job_id", "") or ""),
+         "result": status, "detail": detail or ""}
+    if system_failure:
+        r["system_failure"] = True
+    if extra:
+        for k, v in extra.items():
+            if k not in r and v is not None:
+                r[k] = v
+    return r
+
+
 def process(job: dict, dry_apply: bool) -> dict:
     title = job.get("title", "")[:55]
     log(f"JOB: {title} ({job.get('company','')})")
@@ -493,12 +526,12 @@ def process(job: dict, dry_apply: bool) -> dict:
     if not pdf:
         # SYSTEM failure: alert with the probable cause + leave today unmarked.
         _alert_failure(job, job.get("_fail", {"stage": "résumé tailoring"}))
-        return {"job": title, "result": "tailor_failed", "system_failure": True}
+        return _result(job, "tailor_failed", system_failure=True)
 
     if not tg.configured():
         log("  ⚠ Telegram not configured — cannot request approval. "
             "Add TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to .env.")
-        return {"job": title, "result": "no_telegram", "resume": pdf}
+        return _result(job, "no_telegram", extra={"resume": pdf})
 
     label = tailor.expected_basename(job)
     log("  sending to Telegram for approval...")
@@ -517,14 +550,14 @@ def process(job: dict, dry_apply: bool) -> dict:
     if decision == "timeout":
         # Didn't answer in time — re-queue so it's offered again next run instead
         # of being lost forever (the scrape only looks back 24h). H5.
-        add_pending(job)
+        add_pending(job, "transient", "no approval tap in time")
         tg.send_message(f"⏳ No response in time: {title}\nRe-queued — I'll offer it "
                         "again on the next run.")
-        return {"job": title, "result": "timeout"}
+        return _result(job, "timeout")
     if decision != "approve":
         clear_pending(job["job_id"])  # explicit reject — don't keep re-queuing it
         tg.send_message(f"⏭️ Skipped: {title}")
-        return {"job": title, "result": decision}
+        return _result(job, decision)
 
     # Cover letter — only generate one when the job actually requires it.
     cover_pdf = None
@@ -546,14 +579,14 @@ def process(job: dict, dry_apply: bool) -> dict:
                                                timeout=APPROVAL_TIMEOUT)
             log(f"  cover letter decision: {cl_decision}")
             if cl_decision == "timeout":
-                add_pending(job)
+                add_pending(job, "transient", "no cover-letter approval tap in time")
                 tg.send_message(f"⏳ No response on the cover letter: {title}\n"
                                 "Re-queued — I'll offer it again next run.")
-                return {"job": title, "result": "cover_letter_timeout"}
+                return _result(job, "cover_letter_timeout")
             if cl_decision != "approve":
                 clear_pending(job["job_id"])
                 tg.send_message(f"⏭️ Cover letter rejected — not applying: {title}")
-                return {"job": title, "result": "cover_letter_rejected"}
+                return _result(job, "cover_letter_rejected")
         else:
             # Required cover letter could not be produced -> system failure.
             job["_fail"] = {"stage": "cover letter", "code": cl.get("fail_code"),
@@ -561,7 +594,7 @@ def process(job: dict, dry_apply: bool) -> dict:
                             "attempts": cl.get("attempts")}
             log(f"  ⚠ cover letter FAILED [{cl.get('fail_code')}]: {cl.get('fail_reason')}")
             _alert_failure(job, job["_fail"])
-            return {"job": title, "result": "cover_letter_failed", "system_failure": True}
+            return _result(job, "cover_letter_failed", system_failure=True)
 
     mode = "dry" if dry_apply else "submit"
     transcript = str(TRANSCRIPT) if TRANSCRIPT.exists() else None
@@ -582,21 +615,19 @@ def process(job: dict, dry_apply: bool) -> dict:
     # portal now shows it applied (authoritative flag) — so no double-submit; only a
     # genuinely un-submitted job is re-applied.
     if res["status"] == "submitted_unverified":
-        add_pending(job)
+        add_pending(job, "verify_gap", res["detail"])
         tg.send_message(
             f"⚠️ <b>Unverified submit: {title}</b>\n{res['detail']}\n\n"
             "I'll re-check on the next run: if it actually went through it'll be "
             "auto-skipped (already-applied), if not it'll re-apply. No action needed.")
-        return {"job": title, "result": "submitted_unverified", "detail": res["detail"],
-                "system_failure": True}
+        return _result(job, "submitted_unverified", detail=res["detail"], system_failure=True)
 
     tg.send_message(
         f"{'✅ Applied' if res['status']=='applied' else '⚠️ ' + res['status']}: {title}\n{res['detail']}"
     )
     # A portal error (not a clean terminal state) is a system failure -> retry live.
     if res["status"] == "error":
-        return {"job": title, "result": "error", "detail": res["detail"],
-                "system_failure": True}
+        return _result(job, "error", detail=res["detail"], system_failure=True)
 
     # External apply links from the posting — auto-fill + Telegram submit-gate.
     # external_autofill fills every mappable field from profile.json, sends you
@@ -624,8 +655,7 @@ def process(job: dict, dry_apply: bool) -> dict:
     if ext:
         log(f"  external apply links handled: {ext}")
 
-    return {"job": title, "result": res["status"], "detail": res["detail"],
-            "external": ext}
+    return _result(job, res["status"], detail=res["detail"], extra={"external": ext})
 
 
 def main():
@@ -702,7 +732,7 @@ def main():
                         "Day left unmarked → it'll retry live next login.")
             except Exception:
                 pass
-            results.append({"job": jt, "result": "crashed", "system_failure": True})
+            results.append(_result(j, "crashed", system_failure=True))
 
     log("=" * 55)
     log("SUMMARY:")
