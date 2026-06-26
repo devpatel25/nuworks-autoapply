@@ -1,0 +1,8 @@
+{
+  "apply": {
+    "max_retry_attempts": 4
+  },
+  "supervisor": {
+    "max_diagnoses_per_run": 8
+  }
+}
