@@ -298,6 +298,17 @@ def build_report(applied, auto_fixed, needs_you, session_action, now) -> str:
     return "\n".join(out)
 
 
+def _tally(results) -> str:
+    """Compact one-line outcome count for a run, e.g. '3 processed · 2 applied — 1 reject'.
+    Lets every non-empty run send at least a brief acknowledgment, so an approve tap that
+    ends in a benign outcome (e.g. no_inportal_apply) isn't met with silence."""
+    from collections import Counter
+    c = Counter((r.get("result") or "?") for r in results)
+    applied = c.get("applied", 0)
+    others = ", ".join(f"{v} {k}" for k, v in sorted(c.items()) if k != "applied")
+    return f"{len(results)} processed · {applied} applied" + (f" — {others}" if others else "")
+
+
 def _commit_evictions(pending: list, evict: dict, now) -> list:
     """Remove evicted job_ids from pending_retry.json and append them to wontfix.json
     (which eligible()/merge_pending() filter, so an evicted job stops being re-offered)."""
@@ -411,8 +422,17 @@ def _run(results, now, use_brain=False):
         _commit_evictions(pending, evict, now)
     _write_sentinel(now, {"applied": len(applied), "auto_fixed": len(auto_fixed),
                           "needs_you": len(needs_you)})
+    # Always acknowledge a non-empty run. Rich outcomes (applied / retrying / needs-you /
+    # session) get the full report + a tally footer; a run whose only outcomes were benign
+    # (e.g. no_inportal_apply, reject) still gets a one-line summary instead of silence; a
+    # truly empty run (no results, nothing evicted) stays quiet.
     if applied or auto_fixed or needs_you or session_action:
-        _send(build_report(applied, auto_fixed, needs_you, session_action, now))
+        msg = build_report(applied, auto_fixed, needs_you, session_action, now)
+        if results:
+            msg += f"\n\n📊 {_tally(results)}"
+        _send(msg)
+    elif results:
+        _send(f"🤖 <b>NUworks run — {now:%Y-%m-%d %H:%M}</b>\n📊 {_tally(results)}")
 
 
 # ── launchd backstop (dead-man's switch for the supervisor) ───────────────────

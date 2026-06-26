@@ -148,11 +148,31 @@ class TestLoopBreak(_State):
         self.assertEqual(self._wontfix(), {})
         self.assertTrue(any("Applied: 1" in m for m in self.sent))
 
-    def test_benign_only_run_is_silent(self):
+    def test_benign_only_run_sends_one_line_summary(self):
+        # A run whose only outcome is benign (e.g. an approve tap that ended no_inportal_apply)
+        # still gets a brief acknowledgment instead of silence.
         self._pending([])
-        S._run([{"job_id": "2", "job": "Nope Co", "result": "reject"}], self.now)
-        self.assertEqual(self._wontfix(), {})
-        self.assertEqual(self.sent, [])          # nothing applied/retrying/needs-you -> no report
+        S._run([{"job_id": "2", "job": "Ext Co", "result": "no_inportal_apply"}], self.now)
+        self.assertEqual(self._wontfix(), {})            # benign -> no eviction
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("1 processed", self.sent[0])
+        self.assertIn("0 applied", self.sent[0])
+        self.assertIn("no_inportal_apply", self.sent[0])
+
+    def test_empty_run_is_silent(self):
+        # No results and nothing to evict -> stay quiet (don't spam on an empty run).
+        self._pending([])
+        S._run([], self.now)
+        self.assertEqual(self.sent, [])
+
+    def test_mixed_run_footer_surfaces_benign(self):
+        self._pending([])
+        S._run([{"job_id": "1", "job": "Good Co", "result": "applied"},
+                {"job_id": "2", "job": "Ext Co", "result": "no_inportal_apply"}], self.now)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Applied: 1", self.sent[0])         # full report
+        self.assertIn("2 processed", self.sent[0])        # tally footer
+        self.assertIn("no_inportal_apply", self.sent[0])  # benign outcome now visible
 
 
 class TestBackstop(_State):
