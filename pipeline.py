@@ -231,6 +231,20 @@ def load_skiplist() -> set:
     return out
 
 
+# job_ids the supervisor has given up auto-retrying (data/wontfix.json, a dict keyed by
+# job_id). Filtered out of eligible() + merge_pending() so an evicted job stops looping.
+WONTFIX_FILE = HERE / "data" / "wontfix.json"
+
+
+def load_wontfix() -> set:
+    if not WONTFIX_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(WONTFIX_FILE.read_text()).keys())
+    except Exception:
+        return set()
+
+
 class DuoNotApproved(Exception):
     """The scraper exited (code 3) because the DUO push wasn't approved in its
     window — distinct from other login failures so main() can ask the user, live,
@@ -348,8 +362,10 @@ def load_jobs() -> list[dict]:
 
 
 def eligible(jobs: list[dict]) -> list[dict]:
-    """Keep only in-portal, not-yet-applied jobs that aren't on the skip-list."""
+    """Keep only in-portal, not-yet-applied jobs that aren't on the skip-list or the
+    supervisor's wontfix list (jobs evicted from auto-retry as un-satisfiable)."""
     skiplist = load_skiplist()
+    wontfix = load_wontfix()
     ids = [j["job_id"] for j in jobs]
     classified = asyncio.run(apply_type.classify_jobs(ids))
     cls = {c["job_id"]: c for c in classified}
@@ -360,6 +376,8 @@ def eligible(jobs: list[dict]) -> list[dict]:
         j["_required_docs"] = c.get("required_docs", [])
         if j["job_id"] in skiplist:
             log(f"  skip [skiplist] {j['title'][:50]}")
+        elif j["job_id"] in wontfix:
+            log(f"  skip [wontfix] {j['title'][:50]}")
         elif c.get("type") == "in_portal":
             keep.append(j)
         else:
@@ -378,12 +396,13 @@ def merge_pending(todo: list[dict]) -> list[dict]:
     if not extra:
         return todo
     skiplist = load_skiplist()
+    wontfix = load_wontfix()
     cls = {c["job_id"]: c for c in
            asyncio.run(apply_type.classify_jobs([p["job_id"] for p in extra]))}
     out = list(todo)
     for p in extra:
         c = cls.get(p["job_id"], {})
-        if p["job_id"] in skiplist:
+        if p["job_id"] in skiplist or p["job_id"] in wontfix:
             clear_pending(p["job_id"])
         elif c.get("type") == "in_portal":
             p["_apply_type"] = "in_portal"
@@ -550,13 +569,10 @@ def process(job: dict, dry_apply: bool) -> dict:
     if decision == "timeout":
         # Didn't answer in time — re-queue so it's offered again next run instead
         # of being lost forever (the scrape only looks back 24h). H5.
-        add_pending(job, "transient", "no approval tap in time")
-        tg.send_message(f"⏳ No response in time: {title}\nRe-queued — I'll offer it "
-                        "again on the next run.")
+        add_pending(job, "transient", "no approval tap in time")  # report consolidates this
         return _result(job, "timeout")
     if decision != "approve":
         clear_pending(job["job_id"])  # explicit reject — don't keep re-queuing it
-        tg.send_message(f"⏭️ Skipped: {title}")
         return _result(job, decision)
 
     # Cover letter — only generate one when the job actually requires it.
@@ -580,12 +596,9 @@ def process(job: dict, dry_apply: bool) -> dict:
             log(f"  cover letter decision: {cl_decision}")
             if cl_decision == "timeout":
                 add_pending(job, "transient", "no cover-letter approval tap in time")
-                tg.send_message(f"⏳ No response on the cover letter: {title}\n"
-                                "Re-queued — I'll offer it again next run.")
                 return _result(job, "cover_letter_timeout")
             if cl_decision != "approve":
                 clear_pending(job["job_id"])
-                tg.send_message(f"⏭️ Cover letter rejected — not applying: {title}")
                 return _result(job, "cover_letter_rejected")
         else:
             # Required cover letter could not be produced -> system failure.
@@ -608,23 +621,17 @@ def process(job: dict, dry_apply: bool) -> dict:
     if res["status"] == "applied":
         clear_pending(job["job_id"])  # definitively done — drop from the re-queue
 
-    # submitted_unverified: Submit was clicked but neither the page text nor the
-    # portal flag confirmed it. Leave the day unmarked so it retries, and keep it in
-    # the pending queue so it survives even if it was a re-queued job not in today's
-    # scrape. The retry is SAFE: next run's classification/merge skips it if the
-    # portal now shows it applied (authoritative flag) — so no double-submit; only a
-    # genuinely un-submitted job is re-applied.
+    # submitted_unverified: Submit was clicked but neither the page text nor the portal
+    # flag confirmed it. Re-queue as verify_gap + keep the day MARKED (not a system
+    # failure): the supervisor re-checks next run and the double-apply guard makes a
+    # re-apply safe (it skips if the portal now shows applied). The consolidated report
+    # surfaces it under "retrying"; leaving the day unmarked would re-fire forever.
     if res["status"] == "submitted_unverified":
         add_pending(job, "verify_gap", res["detail"])
-        tg.send_message(
-            f"⚠️ <b>Unverified submit: {title}</b>\n{res['detail']}\n\n"
-            "I'll re-check on the next run: if it actually went through it'll be "
-            "auto-skipped (already-applied), if not it'll re-apply. No action needed.")
-        return _result(job, "submitted_unverified", detail=res["detail"], system_failure=True)
+        return _result(job, "submitted_unverified", detail=res["detail"])
 
-    tg.send_message(
-        f"{'✅ Applied' if res['status']=='applied' else '⚠️ ' + res['status']}: {title}\n{res['detail']}"
-    )
+    # (per-job outcome ping removed — the supervisor's consolidated report covers applied /
+    # blocked / retrying outcomes; see the run_supervisor hook at the end of main().)
     # A portal error (not a clean terminal state) is a system failure -> retry live.
     if res["status"] == "error":
         return _result(job, "error", detail=res["detail"], system_failure=True)
@@ -753,11 +760,16 @@ def main():
     # Record this run's outcomes for the nightly digest (best-effort).
     stats.record_run(jobs, results, marked=not failures)
 
-    if tg.configured() and results:
-        summary = "\n".join(f"{r['result']}: {r['job']}" for r in results)
-        tail = ("\n\n⚠️ Left unmarked — will retry live next login."
-                if failures else "")
-        tg.send_message(f"🏁 <b>Run complete</b>\n\n{summary}{tail}")
+    # Supervisor: classify every outcome, break doomed retry loops (evict un-satisfiable
+    # jobs to data/wontfix.json so eligible()/merge_pending() stop re-offering them), and
+    # send ONE consolidated report — replacing the old scattered per-result pings + this
+    # run's summary blob. Runs AFTER the mark/unmark decision so it can never affect it;
+    # wrapped so a supervisor error never fails the run. Brain stays OFF for this port.
+    try:
+        import supervisor
+        supervisor.run_supervisor(results, marked=not failures, use_brain=False)
+    except Exception as e:
+        log(f"supervisor hook error (run still completed): {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
