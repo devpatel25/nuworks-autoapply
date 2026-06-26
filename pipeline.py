@@ -300,9 +300,20 @@ def scrape_with_duo_retry() -> bool:
             log("No DUO decision in time — leaving today unmarked; next slot retries.")
             return False
         except subprocess.CalledProcessError:
-            # A login failure that ISN'T a DUO timeout (form changed, network,
-            # etc.). Don't consume today's run — retry on next login.
+            # A scrape/login failure that ISN'T a DUO timeout — e.g. the jobs API
+            # couldn't be reached (scraper exit 4), the login form changed, or a
+            # network blip. Don't consume today's run — retry on next login. Alert
+            # so this never again passes silently as "0 new jobs" (the 2026-06-25
+            # failure, where a missed fetch fell back to a stale jobs.csv).
             log("Scrape/login failed (non-DUO error). Will retry on next login.")
+            try:
+                if tg.configured():
+                    tg.send_message("⚠️ NUworks scrape failed (couldn't fetch the "
+                                    "jobs API / login issue — not DUO). Day left "
+                                    "unmarked, it'll retry on next login. Check "
+                                    "logs/scrape_last.log.")
+            except Exception:
+                pass
             return False
         except subprocess.TimeoutExpired:
             log(f"Scrape exceeded {SCRAPE_TIMEOUT}s (browser/login likely wedged). "
