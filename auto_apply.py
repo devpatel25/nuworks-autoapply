@@ -80,41 +80,78 @@ async def _select_existing_resume(page, resume_label) -> bool:
     add a new doc). Returns True on match+select, False on any mismatch/error."""
     try:
         sel = page.locator('select[id^="sy_formfield_resume"]').first
-        options = await sel.locator('option').all_inner_texts()
-        if not any(o.strip() == resume_label for o in options):
-            return False
-        await sel.select_option(label=resume_label)
-        return True
+        # Options load async after the modal opens; poll until populated (more
+        # than the "Select a resume" placeholder + blank) before deciding.
+        for _ in range(10):
+            options = await sel.locator('option').all_inner_texts()
+            if any(o.strip() == resume_label for o in options):
+                await sel.select_option(label=resume_label)
+                return True
+            if len(options) > 2:
+                return False  # populated, genuinely no match
+            await asyncio.sleep(0.5)
+        return False
     except Exception:
         return False
 
 
 async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_label,
                                        max_retries: int = 2) -> bool:
-    """Click Save on the add-resume form. If the doc-cap dialog ("Maximum
-    Documents Reached") fires at Save time (library already at 20 — the form
-    opened fine, the cap only bites on save), free the oldest resume, reopen
-    + re-stage the form, and retry instead of falling through to a
-    Submit-locator TimeoutError later. Returns True once Save clears without
-    hitting the cap, False if still capped after max_retries."""
+    """Save the staged add-resume form, recovering from the NUworks 20-document
+    cap. The cap shows up two ways at Save time — a "Maximum Documents Reached"
+    dialog OR an inline "reached the limit of documents" error that just disables
+    Save — so success is detected structurally (the add form closed after Save),
+    not by matching either message. On a cap: free the oldest resume, reopen +
+    re-stage a fresh form, and retry. Returns True once the resume actually
+    saves, False if still capped after max_retries."""
     for _ in range(max_retries + 1):
-        await add_modal.get_by_role("button", name="Save").first.click(timeout=8000)
-        await asyncio.sleep(3)
-
-        cap = page.get_by_text("Maximum Documents Reached")
         try:
-            capped = (await cap.count()) > 0 and await cap.first.is_visible()
-        except Exception:
-            capped = False
-        if not capped:
-            return True
-
-        try:
-            await page.get_by_role("button", name="Close").first.click(timeout=4000)
+            save = add_modal.get_by_role("button", name="Save").first
+            if await save.is_enabled():
+                await save.click(timeout=8000)
         except Exception:
             pass
 
+        # Success = the resume now appears in the apply modal's dropdown (it was
+        # actually saved to the library). This is a positive goal check, robust to
+        # both cap UIs and to hidden "Add New Resume" DOM templates. Poll briefly
+        # since the option list refreshes async after Save.
+        for _ in range(8):
+            try:
+                opts = await page.locator('select[id^="sy_formfield_resume"]').first.locator('option').all_inner_texts()
+                if any(o.strip() == resume_label for o in opts):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
         import manage_docs
+        # Dropdown didn't show it — confirm against the library (source of truth)
+        # before deleting anything, so a stale client view never triggers
+        # unnecessary over-deletion of resumes.
+        try:
+            lp = await ctx.new_page()
+            try:
+                docs = await manage_docs.list_documents(lp)
+            finally:
+                await lp.close()
+            if any(d["name"] == resume_label for d in docs):
+                return True
+        except Exception:
+            pass
+
+        # Still open -> hit the cap (either UI). Dismiss it (Close = dialog,
+        # add-form Cancel = inline error; scoped so we don't close the whole
+        # apply modal), free a slot, then reopen + re-stage for the next attempt.
+        try:
+            await page.get_by_role("button", name="Close").first.click(timeout=2500)
+        except Exception:
+            pass
+        try:
+            await add_modal.get_by_role("button", name="Cancel").first.click(timeout=2500)
+        except Exception:
+            pass
+
         mp = await ctx.new_page()
         try:
             await manage_docs.delete_oldest_resume(mp)
@@ -124,7 +161,10 @@ async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_l
             await mp.close()
 
         try:
-            await page.get_by_text("add a new resume", exact=False).first.click(timeout=8000)
+            # scope to the visible apply modal — hidden duplicate "add a new
+            # resume" nodes exist in the DOM and an unscoped .first can grab one.
+            apply_modal = page.locator('[role=dialog], .modal').filter(has_text="Submit Your Application")
+            await apply_modal.get_by_text("add a new resume", exact=False).first.click(timeout=8000)
             await add_modal.first.wait_for(state="visible", timeout=6000)
             await page.locator('input[type=file]').first.set_input_files(resume_pdf)
             await page.locator('#doc-label').fill(resume_label)
