@@ -78,7 +78,9 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
                        transcript_pdf: str = None,
                        transcript_label: str = "Transcript",
                        cover_letter_pdf: str = None,
-                       cover_letter_label: str = "Cover Letter") -> dict:
+                       cover_letter_label: str = "Cover Letter",
+                       extra_pdf: str = None,
+                       extra_label: str = "Supporting Document") -> dict:
     """Returns {status, detail, screenshot}. status in {staged, applied,
     already_applied, submitted_unverified, no_inportal_apply,
     blocked_missing_documents, error}.
@@ -93,6 +95,10 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
         cover_letter_pdf = str(Path(cover_letter_pdf).resolve())
         if not Path(cover_letter_pdf).exists():
             cover_letter_pdf = None
+    if extra_pdf:
+        extra_pdf = str(Path(extra_pdf).resolve())
+        if not Path(extra_pdf).exists():
+            extra_pdf = None
     if not Path(resume_pdf).exists():
         return {"status": "error", "detail": f"resume not found: {resume_pdf}"}
 
@@ -239,6 +245,15 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
                             await csel.select_option(label=cover_letter_label, timeout=4000)
                         except Exception:
                             pass
+                    except Exception:
+                        pass
+                # Generic required "Other" slot (e.g. "Other: See Job Description")
+                # whose upload link is just "Add a new document" — attach the
+                # user-supplied supporting doc if one was provided.
+                if extra_pdf and not await submit_btn.is_enabled():
+                    try:
+                        await _attach_document(page, "Add a new document",
+                                               extra_pdf, extra_label)
                     except Exception:
                         pass
 
