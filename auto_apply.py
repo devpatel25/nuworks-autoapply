@@ -73,12 +73,133 @@ async def _attach_document(page, link_text: str, file_path: str, label: str):
     await asyncio.sleep(3)
 
 
+async def _select_existing_resume(page, resume_label) -> bool:
+    """If a resume with this exact label already exists in the apply modal's
+    resume dropdown, select it instead of uploading a duplicate — this is the
+    root-cause fix for the 20-document library cap (every re-tailor used to
+    add a new doc). Returns True on match+select, False on any mismatch/error."""
+    try:
+        sel = page.locator('select[id^="sy_formfield_resume"]').first
+        # Options load async after the modal opens; poll until populated (more
+        # than the "Select a resume" placeholder + blank) before deciding.
+        for _ in range(10):
+            options = await sel.locator('option').all_inner_texts()
+            if any(o.strip() == resume_label for o in options):
+                await sel.select_option(label=resume_label)
+                return True
+            if len(options) > 2:
+                return False  # populated, genuinely no match
+            await asyncio.sleep(0.5)
+        return False
+    except Exception:
+        return False
+
+
+async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_label,
+                                       max_retries: int = 2) -> bool:
+    """Save the staged add-resume form, recovering from the NUworks 20-document
+    cap. The cap shows up two ways at Save time — a "Maximum Documents Reached"
+    dialog OR an inline "reached the limit of documents" error that just disables
+    Save — so success is detected structurally (the add form closed after Save),
+    not by matching either message. On a cap: free the oldest resume, reopen +
+    re-stage a fresh form, and retry. Returns True once the resume actually
+    saves, False if still capped after max_retries."""
+    for _ in range(max_retries + 1):
+        save = add_modal.get_by_role("button", name="Save").first
+        # The staged resume uploads asynchronously; Save stays DISABLED until the
+        # upload finishes. That's the normal case, NOT the doc cap — so wait for
+        # the upload to complete before deciding. Misreading "Save still disabled"
+        # as the cap made the retry delete library resumes for nothing and re-stage
+        # into the same race, over and over (2026-07-20 Tesla run).
+        for _ in range(60):  # ~30s; real uploads finish in seconds, cap never enables
+            try:
+                if await save.is_enabled():
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        try:
+            if await save.is_enabled():
+                await save.click(timeout=8000)
+        except Exception:
+            pass
+
+        # Success = the resume now appears in the apply modal's dropdown (it was
+        # actually saved to the library). This is a positive goal check, robust to
+        # both cap UIs and to hidden "Add New Resume" DOM templates. Poll briefly
+        # since the option list refreshes async after Save.
+        for _ in range(8):
+            try:
+                opts = await page.locator('select[id^="sy_formfield_resume"]').first.locator('option').all_inner_texts()
+                if any(o.strip() == resume_label for o in opts):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        import manage_docs
+        # Dropdown didn't show it — confirm against the library (source of truth)
+        # before deleting anything, so a stale client view never triggers
+        # unnecessary over-deletion of resumes.
+        at_cap = False  # only delete a resume when the library is positively full
+        try:
+            lp = await ctx.new_page()
+            try:
+                docs = await manage_docs.list_documents(lp)
+            finally:
+                await lp.close()
+            if any(d["name"] == resume_label for d in docs):
+                return True
+            # list_documents returns each card twice (responsive layout), so the
+            # real count is len//2. NUworks caps the library at 20.
+            at_cap = (len(docs) // 2) >= 20  # ponytail: hard-coded cap; bump if NUworks changes it
+        except Exception:
+            pass
+
+        # Still open -> hit the cap (either UI). Dismiss it (Close = dialog,
+        # add-form Cancel = inline error; scoped so we don't close the whole
+        # apply modal), free a slot, then reopen + re-stage for the next attempt.
+        try:
+            await page.get_by_role("button", name="Close").first.click(timeout=2500)
+        except Exception:
+            pass
+        try:
+            await add_modal.get_by_role("button", name="Cancel").first.click(timeout=2500)
+        except Exception:
+            pass
+
+        if at_cap:
+            mp = await ctx.new_page()
+            try:
+                await manage_docs.delete_oldest_resume(mp)
+            except Exception:
+                pass
+            finally:
+                await mp.close()
+
+        try:
+            # scope to the visible apply modal — hidden duplicate "add a new
+            # resume" nodes exist in the DOM and an unscoped .first can grab one.
+            apply_modal = page.locator('[role=dialog], .modal').filter(has_text="Submit Your Application")
+            await apply_modal.get_by_text("add a new resume", exact=False).first.click(timeout=8000)
+            await add_modal.first.wait_for(state="visible", timeout=6000)
+            await page.locator('input[type=file]').first.set_input_files(resume_pdf)
+            await page.locator('#doc-label').fill(resume_label)
+            await asyncio.sleep(1)
+        except Exception:
+            return False
+
+    return False
+
+
 async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
                        mode: str = "dry",
                        transcript_pdf: str = None,
                        transcript_label: str = "Transcript",
                        cover_letter_pdf: str = None,
-                       cover_letter_label: str = "Cover Letter") -> dict:
+                       cover_letter_label: str = "Cover Letter",
+                       extra_pdf: str = None,
+                       extra_label: str = "Supporting Document") -> dict:
     """Returns {status, detail, screenshot}. status in {staged, applied,
     already_applied, submitted_unverified, no_inportal_apply,
     blocked_missing_documents, error}.
@@ -93,6 +214,10 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
         cover_letter_pdf = str(Path(cover_letter_pdf).resolve())
         if not Path(cover_letter_pdf).exists():
             cover_letter_pdf = None
+    if extra_pdf:
+        extra_pdf = str(Path(extra_pdf).resolve())
+        if not Path(extra_pdf).exists():
+            extra_pdf = None
     if not Path(resume_pdf).exists():
         return {"status": "error", "detail": f"resume not found: {resume_pdf}"}
 
@@ -143,74 +268,96 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
                 await browser.close()
                 return result
 
+            # Reuse an existing library resume by label if one's already there —
+            # root-cause fix for the 20-doc cap (every re-tailor used to upload a
+            # fresh duplicate). Falls back to the upload flow if no match.
+            reused = await _select_existing_resume(page, resume_label)
+
             # Open "add a new resume" sub-form. If it won't open (NUworks document
             # limit / "Maximum Documents Reached"), delete the oldest resume to free
             # a slot and retry.
             add_modal = page.locator('[role=dialog], .modal').filter(has_text="Add New Resume")
 
-            async def open_add_resume_form() -> bool:
-                try:
-                    await page.get_by_text("add a new resume", exact=False).first.click(timeout=8000)
-                    await add_modal.first.wait_for(state="visible", timeout=6000)
-                    return True
-                except Exception:
-                    return False
+            if not reused:
+                async def open_add_resume_form() -> bool:
+                    try:
+                        await page.get_by_text("add a new resume", exact=False).first.click(timeout=8000)
+                        await add_modal.first.wait_for(state="visible", timeout=6000)
+                        return True
+                    except Exception:
+                        return False
 
-            if not await open_add_resume_form():
-                import manage_docs
-                mp = await ctx.new_page()
-                try:
-                    freed = await manage_docs.delete_oldest_resume(mp)
-                except Exception as e:
-                    freed = {"ok": False, "detail": str(e)}
-                finally:
-                    await mp.close()
-                # Re-open the application and the add-resume form after freeing a slot.
-                await page.goto(job_url(job_id), wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(3)
-                try:
-                    await page.locator("button.btn_primary", has_text="Apply").locator("visible=true").first.click(timeout=12000)
-                    await apply_modal.first.wait_for(state="visible", timeout=10000)
-                except Exception:
-                    pass
                 if not await open_add_resume_form():
-                    result.update(status="error",
-                                  detail=f"Resume upload blocked by document limit; "
-                                         f"freed slot ({freed.get('deleted','?')}) but form still wouldn't open.")
-                    await browser.close()
-                    return result
+                    import manage_docs
+                    mp = await ctx.new_page()
+                    try:
+                        freed = await manage_docs.delete_oldest_resume(mp)
+                    except Exception as e:
+                        freed = {"ok": False, "detail": str(e)}
+                    finally:
+                        await mp.close()
+                    # Re-open the application and the add-resume form after freeing a slot.
+                    await page.goto(job_url(job_id), wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(3)
+                    try:
+                        await page.locator("button.btn_primary", has_text="Apply").locator("visible=true").first.click(timeout=12000)
+                        await apply_modal.first.wait_for(state="visible", timeout=10000)
+                    except Exception:
+                        pass
+                    if not await open_add_resume_form():
+                        result.update(status="error",
+                                      detail=f"Resume upload blocked by document limit; "
+                                             f"freed slot ({freed.get('deleted','?')}) but form still wouldn't open.")
+                        await browser.close()
+                        return result
 
-            # Stage the file + label
-            await page.locator('input[type=file]').first.set_input_files(resume_pdf)
-            await page.locator('#doc-label').fill(resume_label)
-            await asyncio.sleep(1)
+                # Stage the file + label
+                await page.locator('input[type=file]').first.set_input_files(resume_pdf)
+                await page.locator('#doc-label').fill(resume_label)
+                await asyncio.sleep(1)
 
             shot = str(SHOTS / f"apply_{job_id[:8]}_ready.png")
             await page.screenshot(path=shot, full_page=True)
             result["screenshot"] = shot
 
             if mode != "submit":
-                # DRY RUN — cancel out, nothing uploaded or submitted
+                # DRY RUN — cancel out, nothing uploaded or submitted. Reused-resume
+                # runs never opened add_modal, so cancel the apply modal instead.
                 try:
-                    await add_modal.get_by_role("button", name="Cancel").first.click(timeout=5000)
+                    if reused:
+                        try:
+                            await apply_modal.get_by_role("button", name="Cancel").first.click(timeout=5000)
+                        except Exception:
+                            await page.get_by_role("button", name="Cancel").first.click(timeout=5000)
+                    else:
+                        await add_modal.get_by_role("button", name="Cancel").first.click(timeout=5000)
                 except Exception:
                     pass
                 result.update(status="staged",
-                              detail="Resume staged in upload form; STOPPED before Save/Submit (dry run).")
+                              detail=("Reused existing library resume; " if reused else "") +
+                                     "Resume staged in upload form; STOPPED before Save/Submit (dry run).")
                 await browser.close()
                 return result
 
             # ---- REAL SUBMISSION (post-approval only) ----
-            # Save the uploaded resume to the library
-            await add_modal.get_by_role("button", name="Save").first.click(timeout=8000)
-            await asyncio.sleep(3)  # upload + return to apply modal
+            if not reused:
+                # Save the uploaded resume to the library, retrying through the
+                # doc-cap dialog if the library filled to 20 in the meantime.
+                saved = await _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_label)
+                if not saved:
+                    result.update(status="error",
+                                  detail="Resume upload blocked by document limit; freed slots "
+                                         "but Save still hit the cap.")
+                    await page.screenshot(path=str(SHOTS / f"apply_{job_id[:8]}_capfail.png"), full_page=True)
+                    await browser.close()
+                    return result
 
-            # Ensure the resume is selected in the dropdown
-            try:
-                sel = page.locator('select[id^="sy_formfield_resume"]').first
-                await sel.select_option(label=resume_label, timeout=5000)
-            except Exception:
-                pass  # newly added resume is typically auto-selected
+                # Ensure the resume is selected in the dropdown
+                try:
+                    sel = page.locator('select[id^="sy_formfield_resume"]').first
+                    await sel.select_option(label=resume_label, timeout=5000)
+                except Exception:
+                    pass  # newly added resume is typically auto-selected
 
             # Some jobs require extra documents (Transcript, etc.) — Submit stays
             # disabled until they're attached.
@@ -239,6 +386,15 @@ async def apply_to_job(job_id: str, resume_pdf: str, resume_label: str,
                             await csel.select_option(label=cover_letter_label, timeout=4000)
                         except Exception:
                             pass
+                    except Exception:
+                        pass
+                # Generic required "Other" slot (e.g. "Other: See Job Description")
+                # whose upload link is just "Add a new document" — attach the
+                # user-supplied supporting doc if one was provided.
+                if extra_pdf and not await submit_btn.is_enabled():
+                    try:
+                        await _attach_document(page, "Add a new document",
+                                               extra_pdf, extra_label)
                     except Exception:
                         pass
 
