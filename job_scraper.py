@@ -320,7 +320,7 @@ async def intercept_jobs_page(page, postdate: int, pg: int, per_page: int = 100,
     return None
 
 
-async def scrape_all_jobs(page, postdate: int = 1) -> list[dict]:
+async def scrape_all_jobs(page, postdate: int = 7) -> list[dict]:
     """Fetch every page of the job-search results by intercepting the app's own
     API calls. Raises ScrapeError if the data call is never captured (so the
     caller exits non-zero and the pipeline retries rather than keeping a stale
@@ -437,7 +437,7 @@ def save_csv(jobs: list[dict]):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_window(argv) -> int:
-    """Look-back window in days. Default 1 (past 24h); override with
+    """Look-back window in days. Default 7 (past week); override with
     --postdate N / --window-days N / --days N for a broader sweep."""
     for flag in ("--postdate", "--window-days", "--days"):
         if flag in argv:
@@ -445,10 +445,10 @@ def parse_window(argv) -> int:
                 return max(1, int(argv[argv.index(flag) + 1]))
             except (ValueError, IndexError):
                 pass
-    return 1
+    return 7
 
 
-async def main(postdate: int = 1) -> int:
+async def main(postdate: int = 7) -> int:
     username, password = load_credentials()
 
     print("  Launching browser...")

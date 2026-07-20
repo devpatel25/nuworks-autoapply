@@ -165,8 +165,7 @@ def mark_ran_today():
 
 
 # Jobs the user didn't decide on in time (approval timed out). Re-queued on the
-# next run so a busy afternoon doesn't lose a posting forever (the scrape only
-# looks back 24h, so a timed-out job otherwise never reappears). H5.
+# next run so a busy afternoon doesn't lose a posting forever. H5.
 PENDING_FILE = HERE / "data" / "pending_retry.json"
 
 
@@ -229,6 +228,12 @@ def load_skiplist() -> set:
         if token:
             out.add(token)
     return out
+
+
+def add_to_skiplist(job_id: str):
+    SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SKIP_FILE, "a") as f:
+        f.write(f"{job_id}\n")
 
 
 # job_ids the supervisor has given up auto-retrying (data/wontfix.json, a dict keyed by
@@ -572,7 +577,8 @@ def process(job: dict, dry_apply: bool) -> dict:
         add_pending(job, "transient", "no approval tap in time")  # report consolidates this
         return _result(job, "timeout")
     if decision != "approve":
-        clear_pending(job["job_id"])  # explicit reject — don't keep re-queuing it
+        clear_pending(job["job_id"])
+        add_to_skiplist(job["job_id"])  # prevent re-presentation in wider scrape window
         return _result(job, decision)
 
     # Cover letter — only generate one when the job actually requires it.
