@@ -105,8 +105,20 @@ async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_l
     re-stage a fresh form, and retry. Returns True once the resume actually
     saves, False if still capped after max_retries."""
     for _ in range(max_retries + 1):
+        save = add_modal.get_by_role("button", name="Save").first
+        # The staged resume uploads asynchronously; Save stays DISABLED until the
+        # upload finishes. That's the normal case, NOT the doc cap — so wait for
+        # the upload to complete before deciding. Misreading "Save still disabled"
+        # as the cap made the retry delete library resumes for nothing and re-stage
+        # into the same race, over and over (2026-07-20 Tesla run).
+        for _ in range(60):  # ~30s; real uploads finish in seconds, cap never enables
+            try:
+                if await save.is_enabled():
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         try:
-            save = add_modal.get_by_role("button", name="Save").first
             if await save.is_enabled():
                 await save.click(timeout=8000)
         except Exception:
@@ -129,6 +141,7 @@ async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_l
         # Dropdown didn't show it — confirm against the library (source of truth)
         # before deleting anything, so a stale client view never triggers
         # unnecessary over-deletion of resumes.
+        at_cap = False  # only delete a resume when the library is positively full
         try:
             lp = await ctx.new_page()
             try:
@@ -137,6 +150,9 @@ async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_l
                 await lp.close()
             if any(d["name"] == resume_label for d in docs):
                 return True
+            # list_documents returns each card twice (responsive layout), so the
+            # real count is len//2. NUworks caps the library at 20.
+            at_cap = (len(docs) // 2) >= 20  # ponytail: hard-coded cap; bump if NUworks changes it
         except Exception:
             pass
 
@@ -152,13 +168,14 @@ async def _save_resume_with_cap_retry(page, ctx, add_modal, resume_pdf, resume_l
         except Exception:
             pass
 
-        mp = await ctx.new_page()
-        try:
-            await manage_docs.delete_oldest_resume(mp)
-        except Exception:
-            pass
-        finally:
-            await mp.close()
+        if at_cap:
+            mp = await ctx.new_page()
+            try:
+                await manage_docs.delete_oldest_resume(mp)
+            except Exception:
+                pass
+            finally:
+                await mp.close()
 
         try:
             # scope to the visible apply modal — hidden duplicate "add a new
