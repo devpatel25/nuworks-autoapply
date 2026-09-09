@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import csv
+import time
 import json
 import html
 import asyncio
@@ -105,6 +106,43 @@ def looks_like_login(url: str) -> bool:
     return any(h in url.lower() for h in LOGIN_HINTS)
 
 
+# Terminal (non-progressing) login-failure pages, in priority order — checked
+# against raw page HTML during the DUO wait loop so a page that will NEVER
+# change (a Duo error screen, a Chrome network-error interstitial, an Entra
+# AADSTS rejection) fails in ~2s instead of burning the full DUO_WAIT_SECONDS.
+# Patterns come from real captures in logs/screenshots/*_login_timeout.html —
+# see tests/test_login_classify.py, which asserts against those exact files.
+_LOGIN_TERMINAL_PATTERNS = [
+    ("duo_push_timeout", re.compile(r"Duo Push timed out")),
+    ("duo_warning",       re.compile(r"Something went wrong")),
+    ("network_error",     re.compile(r"ERR_NETWORK_CHANGED|connection was interrupted")),
+    ("aadsts_error",      re.compile(r"AADSTS\d+")),
+]
+
+# label -> (exit code, human-readable reason for the Telegram alert).
+# duo_push_timeout reuses exit 3 (pipeline.py's existing "ask to resend the
+# push" flow) since it IS that same case, just detected early. Everything
+# else is a distinct exit code so pipeline.py's existing non-3 branch
+# (alert + leave today unmarked + retry next login) handles it — no
+# pipeline.py changes needed.
+_LOGIN_FAILURE_INFO = {
+    "duo_push_timeout": (3, "Duo reported the push itself timed out"),
+    "duo_warning":      (5, "Duo login warning (Duo-side error — contact IT help desk if this repeats)"),
+    "network_error":    (5, "network error reaching Microsoft login (ERR_NETWORK_CHANGED / connection interrupted)"),
+    "aadsts_error":     (5, "Microsoft SSO rejected the login request (AADSTS error — see logs/screenshots for the exact code)"),
+}
+
+
+def classify_login_page(content: str) -> str | None:
+    """Classify a terminal login-failure page from its raw HTML. Returns a
+    short label if `content` matches a known dead-end, or None if it doesn't
+    (login may still be in progress — NOT a signal to fail)."""
+    for label, pattern in _LOGIN_TERMINAL_PATTERNS:
+        if pattern.search(content):
+            return label
+    return None
+
+
 async def trigger_duo_push(page) -> bool:
     """Auto-click DUO's 'Send Me a Push' so the push is sent without manual
     interaction. Checks the main page AND any Duo iframe; retries ~30s while the
@@ -151,32 +189,92 @@ async def do_login(page, username: str, password: str):
         except Exception:
             pass
 
-    for sel in ['input[id="username"]', 'input[name="username"]',
-                'input[type="email"]', 'input[name="USER"]']:
+    # NEU's SSO now goes straight to Microsoft's login page, which is a
+    # TWO-STEP form: username -> click Next -> a real password field only
+    # THEN renders on a second screen -> click Sign in. (The password input
+    # that exists on the username screen is a hidden decoy Microsoft ships to
+    # foil browser autofill: class="moveOffScreen" aria-hidden="true" -- filling
+    # it does nothing.) Also: Microsoft rejects a bare username here ("We
+    # couldn't find an account with that username") -- it needs the full
+    # username@northeastern.edu form.
+    try:
+        await page.wait_for_selector(
+            'input[name="loginfmt"], input[id="username"], input[type="email"]',
+            timeout=20_000, state="visible")
+    except PWTimeout:
+        pass
+
+    for sel in ['input[name="loginfmt"]', 'input[id="username"]',
+                'input[name="username"]', 'input[type="email"]', 'input[name="USER"]']:
         try:
-            await page.fill(sel, username, timeout=3000)
+            await page.fill(sel, username, timeout=5000)
             break
         except Exception:
             pass
 
-    for sel in ['input[type="password"]', 'input[id="password"]',
-                'input[name="password"]', 'input[name="PASSWORD"]']:
+    for sel in ['#idSIButton9', 'input[type="submit"]', 'button:has-text("Next")']:
         try:
-            await page.fill(sel, password, timeout=3000)
+            await page.click(sel, timeout=5000)
+            print("  ✓ Clicked Next (username step)")
             break
         except Exception:
             pass
 
-    for sel in ['button[type="submit"]', 'input[type="submit"]',
-                'button:has-text("Login")', 'button:has-text("Sign in")']:
+    try:
+        await page.wait_for_selector('input[type="password"]:visible', timeout=20_000)
+    except PWTimeout:
+        pass
+    await asyncio.sleep(1)  # let the SPA settle before touching the field
+
+    # Verify-and-retry: filling this field the instant it appears can race the
+    # page's own re-render and silently land in a field that gets wiped, which
+    # then submits an empty password ("Please enter your password").
+    filled_sel, pw_value = None, ""
+    for _ in range(4):
+        for sel in ['input[type="password"]:visible', 'input[name="passwd"]:visible',
+                    'input[id="password"]:visible']:
+            try:
+                await page.fill(sel, password, timeout=5000)
+                filled_sel = sel
+                break
+            except Exception:
+                pass
+        if filled_sel:
+            try:
+                pw_value = await page.locator(filled_sel).first.input_value()
+            except Exception:
+                pw_value = ""
+        if pw_value == password:
+            break
+        await asyncio.sleep(1)
+
+    for sel in ['#idSIButton9', 'input[type="submit"]', 'button:has-text("Sign in")']:
         try:
-            await page.click(sel, timeout=3000)
+            await page.click(sel, timeout=5000)
+            print("  ✓ Clicked Sign in (password step)")
             break
         except Exception:
             pass
+
+    await asyncio.sleep(2)
+
+    # DUO's redesigned prompt shows a "Is this your device?" gate before any
+    # push option. "Yes, this is my device" also has DUO remember it, which
+    # should cut down on how often future runs need a fresh push at all.
+    for sel in ['button:has-text("Yes, this is my device")',
+                'a:has-text("Yes, this is my device")',
+                ':text("Yes, this is my device")']:
+        try:
+            el = page.locator(sel).first
+            if await el.count() and await el.is_visible():
+                await el.click(timeout=3000)
+                print("  ✓ Confirmed device on DUO's 'Is this your device?' screen")
+                break
+        except Exception:
+            pass
+    await asyncio.sleep(1)
 
     # Auto-send the DUO push (this config requires clicking "Send Me a Push").
-    await asyncio.sleep(3)  # let the DUO prompt render
     pushed = await trigger_duo_push(page)
 
     print("\n" + "=" * 55)
@@ -193,20 +291,50 @@ async def do_login(page, username: str, password: str):
         + f"{DUO_WAIT_SECONDS // 60} minutes, or this run is skipped.")
 
     deadline = asyncio.get_event_loop().time() + DUO_WAIT_SECONDS
+    authed = False
+    fail_reason = None
     while asyncio.get_event_loop().time() < deadline:
         try:
             if "northeastern-csm.symplicity.com" in page.url and not looks_like_login(page.url):
+                authed = True
+                break
+            fail_reason = classify_login_page(await page.content())
+            if fail_reason:
                 break
         except Exception:
             pass
         await asyncio.sleep(2)
-    else:
-        print(f"  ⚠  Timed out waiting for DUO ({DUO_WAIT_SECONDS // 60} min).")
-        # Exit code 3 = "DUO not approved in time" specifically (vs other login
-        # failures). pipeline.py treats this code as a prompt to ask the user, via
-        # Telegram, whether to resend the push and rerun now or skip for today — so
-        # we DON'T send a "run skipped" message here (the pipeline owns that UX).
-        sys.exit(3)
+
+    if not authed:
+        if fail_reason:
+            print(f"  ⚠  Login failed fast — recognized dead-end page: {fail_reason}")
+        else:
+            print(f"  ⚠  Timed out waiting for DUO ({DUO_WAIT_SECONDS // 60} min) — no recognized error page.")
+        # This step used to fail completely silently (no screenshot, no HTML) --
+        # the only reason the two-step-login / hidden-decoy-password / DUO
+        # device-gate bugs above ever got diagnosed was a one-off manual capture.
+        # Dump evidence here so the next portal change doesn't cost another week.
+        try:
+            shots = HERE / "logs" / "screenshots"
+            shots.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            await page.screenshot(path=str(shots / f"{ts}_login_timeout.png"), full_page=True)
+            (shots / f"{ts}_login_timeout.html").write_text(await page.content())
+            print(f"  ✓ Saved login-timeout screenshot+HTML → {shots}")
+        except Exception as e:
+            print(f"  ⚠  Failed to capture login-timeout evidence: {e}")
+        # Exit code 3 = "DUO not approved in time" (pipeline.py asks the user,
+        # via Telegram, whether to resend the push and rerun or skip for today).
+        # Any other code lands in pipeline.py's existing non-3 branch (alert +
+        # leave today unmarked + retry next login) — no pipeline.py changes
+        # needed. We DON'T send a "run skipped" message here either way (the
+        # pipeline owns that UX); we DO send the specific reason so it's not
+        # just "not DUO", it's ACTUALLY why.
+        exit_code, human_reason = _LOGIN_FAILURE_INFO.get(
+            fail_reason, (3, f"timed out waiting for DUO approval ({DUO_WAIT_SECONDS // 60} min), "
+                             "no recognized error page — possibly a new failure mode"))
+        notify_telegram(f"🔐 NUworks login failed: {human_reason}.")
+        sys.exit(exit_code)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
@@ -245,8 +373,13 @@ async def ensure_logged_in(page, context, username: str, password: str):
         return
 
     print("  Session missing or expired — logging in...")
-    # Clear the stale cookies so the portal cleanly redirects to the SSO login.
-    await context.clear_cookies()
+    # Clear only the Symplicity/NEU-identity cookies so the portal cleanly
+    # redirects to SSO — NOT the Duo browser-trust cookie (30-day, lets a
+    # trusted browser skip the push entirely) or Microsoft's persistent Entra
+    # cookies (up to 90-day). An unscoped clear_cookies() here used to throw
+    # those away on every expired-Symplicity-session run, guaranteeing a fresh
+    # Duo challenge that would otherwise have been skipped silently.
+    await context.clear_cookies(domain=re.compile(r"symplicity\.com$|^neuidmsso\.neu\.edu$"))
     await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=10_000)
@@ -453,9 +586,16 @@ async def main(postdate: int = 7) -> int:
 
     print("  Launching browser...")
     async with async_playwright() as pw:
+        # Real Chrome (not plain Chromium) + AutomationControlled disabled —
+        # confirmed 6/6 reliable against Duo's browser-integrity check in
+        # duo_probe_tmp.py, where plain Chromium reliably hit
+        # browser_check_failed. No spoofed user-agent: a Chrome/124 UA string
+        # on a non-Chrome binary was itself an integrity signal; real Chrome
+        # sends its own genuine UA.
         browser = await pw.chromium.launch(
             headless=False,
-            args=["--start-maximized"],
+            channel="chrome",
+            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
         )
 
         ctx_opts = {}
@@ -466,11 +606,6 @@ async def main(postdate: int = 7) -> int:
         context = await browser.new_context(
             **ctx_opts,
             viewport={"width": 1400, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
         )
         page = await context.new_page()
 
