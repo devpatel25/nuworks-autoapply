@@ -12,6 +12,7 @@ Setup (one time):
   3. Open your new bot, tap Start
   4. Save both into ../.env as TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
 """
+import io
 import os
 import re
 import json
@@ -41,12 +42,40 @@ def _require():
         )
 
 
+def _post_with_retry(fn, attempts: int = 4):
+    """Retry a Telegram POST callable on transient network failures and honor
+    429 rate-limiting. fn() performs the request and returns the parsed JSON.
+
+    Telegram's API occasionally drops the connection mid-request
+    (ConnectionResetError / ConnectionError). A single un-retried blip during
+    the approval-card send crashed 4 jobs in one run (2026-09-10, all four hit
+    "Connection reset by peer" on send_resume_for_approval and were left
+    unmarked to retry the whole day). Wellfound got this same retry treatment
+    after an identical incident (2026-06-25); NUworks never did — this ports it.
+    """
+    last_err = None
+    for i in range(attempts):
+        try:
+            j = fn()
+            if j.get("ok") is False and j.get("error_code") == 429:
+                retry_after = (j.get("parameters") or {}).get("retry_after", 2)
+                last_err = RuntimeError(f"429 rate-limited: {j}")
+                time.sleep(min(retry_after, 30))
+                continue
+            return j
+        except requests.RequestException as e:
+            last_err = e
+            if i < attempts - 1:
+                time.sleep(2 ** i)  # 1s, 2s, 4s
+    raise RuntimeError(f"Telegram POST failed after {attempts} attempts: {last_err}")
+
+
 def send_message(text: str, parse_mode: str = "HTML") -> dict:
     _require()
-    r = requests.post(f"{API}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode},
-                      timeout=30)
-    return r.json()
+    return _post_with_retry(lambda: requests.post(
+        f"{API}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode},
+        timeout=30).json())
 
 
 def _fmt_pay(salary: str) -> str:
@@ -89,17 +118,49 @@ def send_resume_for_approval(pdf_path: str, job: dict, summary: str = "",
         {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
     ]]}
 
-    with open(pdf_path, "rb") as f:
-        r = requests.post(
-            f"{API}/sendDocument",
-            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
-                  "reply_markup": __import__("json").dumps(keyboard)},
-            files={"document": (Path(pdf_path).name, f, "application/pdf")},
-            timeout=60,
-        )
-    res = r.json()
+    pdf_bytes = Path(pdf_path).read_bytes()  # read once; retries need a fresh stream each attempt
+    pdf_name = Path(pdf_path).name
+    res = _post_with_retry(lambda: requests.post(
+        f"{API}/sendDocument",
+        data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
+              "reply_markup": json.dumps(keyboard)},
+        files={"document": (pdf_name, io.BytesIO(pdf_bytes), "application/pdf")},
+        timeout=60).json())
     if not res.get("ok"):
         raise RuntimeError(f"Telegram sendDocument failed: {res}")
+    return res["result"]["message_id"]
+
+
+def send_job_for_approval(job: dict, nonce: str = "") -> int:
+    """Send the job POSTING ONLY (no resume yet) with Approve/Reject buttons — gates
+    whether a resume gets tailored at all, so a reject here costs zero tailor tokens.
+    Same callback_data scheme as send_resume_for_approval, so wait_for_decision works
+    unchanged for this gate too."""
+    _require()
+    jid = job["job_id"]
+    caption = (
+        f"🆕 <b>New job match</b>\n\n"
+        f"<b>{html.escape(job.get('title','')[:80])}</b>\n"
+        f"{html.escape(job.get('company',''))} — {html.escape(job.get('location',''))}\n"
+        f"💵 Pay: {html.escape(_fmt_pay(job.get('salary','')))}\n"
+        f"🗓 Deadline: {html.escape(str(job.get('deadline') or '—'))}\n"
+    )
+    ext = [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
+    if ext:
+        caption += "🌐 External: " + "  ".join(ext) + "\n"
+    caption += "\nApprove to tailor a resume + apply, or Reject to skip (no resume generated)."
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Approve", "callback_data": f"approve:{jid}:{nonce}"},
+        {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
+    ]]}
+    res = _post_with_retry(lambda: requests.post(
+        f"{API}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": caption, "parse_mode": "HTML",
+              "reply_markup": json.dumps(keyboard)},
+        timeout=30).json())
+    if not res.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage (job approval) failed: {res}")
     return res["result"]["message_id"]
 
 
@@ -130,15 +191,14 @@ def send_cover_letter_for_approval(pdf_path: str, job: dict, nonce: str = "") ->
         {"text": "✅ Approve letter", "callback_data": f"approve:{jid}:{nonce}"},
         {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
     ]]}
-    with open(pdf_path, "rb") as f:
-        r = requests.post(
-            f"{API}/sendDocument",
-            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
-                  "reply_markup": __import__("json").dumps(keyboard)},
-            files={"document": (Path(pdf_path).name, f, "application/pdf")},
-            timeout=60,
-        )
-    res = r.json()
+    pdf_bytes = Path(pdf_path).read_bytes()  # read once; retries need a fresh stream each attempt
+    pdf_name = Path(pdf_path).name
+    res = _post_with_retry(lambda: requests.post(
+        f"{API}/sendDocument",
+        data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
+              "reply_markup": json.dumps(keyboard)},
+        files={"document": (pdf_name, io.BytesIO(pdf_bytes), "application/pdf")},
+        timeout=60).json())
     if not res.get("ok"):
         raise RuntimeError(f"Telegram sendDocument (cover letter) failed: {res}")
     return res["result"]["message_id"]
@@ -218,13 +278,11 @@ def send_duo_decision(nonce: str = "") -> int:
         {"text": "🔁 Rerun (resend DUO)", "callback_data": f"duo_rerun:{nonce}"},
         {"text": "⏭️ Skip today", "callback_data": f"duo_skip:{nonce}"},
     ]]}
-    r = requests.post(
+    res = _post_with_retry(lambda: requests.post(
         f"{API}/sendMessage",
         data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
               "reply_markup": json.dumps(keyboard)},
-        timeout=30,
-    )
-    res = r.json()
+        timeout=30).json())
     if not res.get("ok"):
         raise RuntimeError(f"Telegram sendMessage (duo decision) failed: {res}")
     return res["result"]["message_id"]

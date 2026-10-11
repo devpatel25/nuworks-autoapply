@@ -50,6 +50,10 @@ JOBS_CSV = HERE / "data" / "jobs.csv"
 LOG_DIR = HERE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# Pause flag toggled by /pause nuworks and /continue nuworks (claude-bridge/
+# bridge.py) — checked at the top of every sibling pipeline against its own name.
+PAUSE_FLAG = HERE.parent / ".autoapply_paused.nuworks"
+
 # Single-instance lock. The LaunchAgent fires at 6 slots/day AND on login; a run
 # that is still waiting on a Telegram approval (up to 1h/job) can easily still be
 # alive when the next slot fires. Two overlapping runs would re-scrape, re-send
@@ -101,6 +105,11 @@ APPLY_BUDGET    = 300                                                  # one por
 TAILOR_PARALLELISM = int(os.environ.get("NUWORKS_TAILOR_PARALLELISM", "6"))
 
 _watchdog_deadline = None  # wall-clock time the run must not pass
+_scrape_pgid = None  # process group of the live scrape() subprocess, if any (so the
+                     # watchdog can kill it too instead of orphaning it — the 06-10 and
+                     # 09-12 incidents: a sleep/wake stall trips the watchdog, but without
+                     # this the scrape subprocess keeps running unattended and its result
+                     # (session.json / jobs.csv) is silently never consumed by anyone)
 
 
 def _start_watchdog(budget: int):
@@ -116,6 +125,11 @@ def _start_watchdog(budget: int):
             if _watchdog_deadline and time.time() > _watchdog_deadline:
                 log("⏱️  WATCHDOG: run exceeded its time budget — a step is hung. "
                     "Aborting (today left UNMARKED → retries on next login).")
+                if _scrape_pgid is not None:
+                    try:
+                        os.killpg(_scrape_pgid, signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
                     if tg.configured():
                         tg.send_message(
@@ -269,12 +283,15 @@ def scrape():
     # inherited pipe). On timeout we SIGKILL the whole group so a wedged
     # browser/login can never hang the run (today's 06-06 failure mode). Output
     # to scrape_last.log survives a kill, unlike buffered stdout.
+    global _scrape_pgid
     scrape_log = LOG_DIR / "scrape_last.log"
     with open(scrape_log, "w") as f:
         proc = subprocess.Popen(
             [sys.executable, "-u", str(HERE / "job_scraper.py")],
             cwd=str(HERE), stdout=f, stderr=subprocess.STDOUT,
             start_new_session=True)
+        _scrape_pgid = proc.pid  # start_new_session means pgid == pid; lets the
+                                 # top-level watchdog kill it too if IT trips first
         try:
             rc = proc.wait(timeout=SCRAPE_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -283,6 +300,8 @@ def scrape():
             except Exception:
                 proc.kill()
             raise
+        finally:
+            _scrape_pgid = None
     if rc == 3:
         # DUO push wasn't approved in the scraper's window — a normal, expected
         # outcome that main() handles by asking the user to rerun or skip.
@@ -539,6 +558,36 @@ def _result(job: dict, status: str, detail: str = "", system_failure: bool = Fal
     return r
 
 
+def gate_by_posting(todo: list) -> tuple[list, list]:
+    """STAGE 1 — approve/reject on the job posting alone, BEFORE a resume is tailored.
+    A reject or timeout here never calls claude -p, so rejected postings cost zero
+    tailor tokens. Approved jobs still go through the existing resume-review approval
+    in process() before anything is actually submitted. Returns (approved, results_for_the_rest)."""
+    approved, results = [], []
+    for job in todo:
+        title = job.get("title", "")[:55]
+        log(f"JOB: {title} ({job.get('company','')})  [posting approval]")
+        if not tg.configured():
+            log("  ⚠ Telegram not configured — cannot gate; approving by default.")
+            approved.append(job)
+            continue
+        bump_watchdog(APPROVAL_TIMEOUT + 60)
+        nonce = uuid.uuid4().hex[:8]
+        tg.send_job_for_approval(job, nonce=nonce)
+        decision = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=APPROVAL_TIMEOUT)
+        log(f"  posting decision: {decision}")
+        if decision == "approve":
+            approved.append(job)
+        elif decision == "timeout":
+            add_pending(job, "transient", "no posting-approval tap in time")
+            results.append(_result(job, "timeout"))
+        else:
+            clear_pending(job["job_id"])
+            add_to_skiplist(job["job_id"])
+            results.append(_result(job, decision))
+    return approved, results
+
+
 def process(job: dict, dry_apply: bool) -> dict:
     title = job.get("title", "")[:55]
     log(f"JOB: {title} ({job.get('company','')})")
@@ -684,6 +733,10 @@ def main():
     log("NUworks auto-apply pipeline starting")
     log(f"telegram configured: {tg.configured()} | dry_apply: {dry_apply} | force: {force}")
 
+    if PAUSE_FLAG.exists():
+        log("Paused via Telegram /pause — skipping this run.")
+        return
+
     # Refuse to run if another instance is already active (e.g. a previous slot
     # still waiting on a Telegram approval). Prevents overlapping runs from
     # double-submitting or stealing each other's Telegram taps.
@@ -719,16 +772,21 @@ def main():
         todo = todo[:limit]
     log(f"{len(todo)} in-portal jobs to process")
 
-    # Tailor ALL resumes concurrently up front (the slow claude -p calls), right
-    # after the jobs are scraped + classified — instead of one-at-a-time inside the
-    # apply loop. Each job's PDF is cached on job["_resume_pdf"]; get_resume() reuses
-    # it. Collapses serial N×(minutes-per-resume) into ~one wave (mirrors handshake).
+    # STAGE 1 — approve/reject on the posting alone, BEFORE spending any tailor
+    # tokens. Only postings you actually approve here reach the (slow, costly)
+    # claude -p tailoring wave below.
+    todo, results = gate_by_posting(todo)
+    log(f"{len(todo)} posting(s) approved for tailoring")
+
+    # Tailor ALL approved resumes concurrently up front (the slow claude -p calls)
+    # — instead of one-at-a-time inside the apply loop. Each job's PDF is cached on
+    # job["_resume_pdf"]; get_resume() reuses it. Collapses serial
+    # N×(minutes-per-resume) into ~one wave (mirrors handshake).
     tailor_all_parallel(todo, TAILOR_PARALLELISM)
 
     # Crash-proof each job: a transient Telegram/network/Playwright error in one
     # job must NOT abort the whole day's remaining jobs (H1). A crash is treated
     # as a system failure so the day is left unmarked and retries next login.
-    results = []
     for j in todo:
         try:
             results.append(process(j, dry_apply))
