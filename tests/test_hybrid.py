@@ -1145,5 +1145,137 @@ class TestSupervisorKnowsNewResults(unittest.TestCase):
         self.assertEqual(S.pre_classify("postcheck_failed", 0), "transient")
 
 
+# ── Phase 5: bi_scan.py (MCP mocked) ─────────────────────────────────────────
+import io  # noqa: E402
+import contextlib  # noqa: E402
+import subprocess  # noqa: E402
+import bi_scan as BS  # noqa: E402
+
+
+class FakeProc:
+    def __init__(self, out="", err="", rc=0, hang=False):
+        self.out, self.err, self.returncode, self.hang, self.pid = out, err, rc, hang, 1
+
+    def communicate(self, timeout=None):
+        if self.hang:
+            self.hang = False
+            raise subprocess.TimeoutExpired("uv", timeout)
+        return self.out, self.err
+
+
+class TestBiScanClient(unittest.TestCase):
+    def setUp(self):
+        self.mcp = Path(tempfile.mkdtemp())
+        self.argv = []
+        for target, attr, val in ((RA, "agent_cfg", lambda k: str(self.mcp) if k == "bi_mcp_dir"
+                                   else RA.AGENT_DEFAULTS[k]),
+                                  (BS.shutil, "which", lambda n: "/usr/bin/uv")):
+            p = patch.object(target, attr, val); p.start(); self.addCleanup(p.stop)
+
+    def tearDown(self):
+        shutil.rmtree(self.mcp, ignore_errors=True)
+
+    def popen(self, proc):
+        def f(argv, **kw):
+            self.argv.append(argv)
+            self.assertTrue(kw.get("start_new_session"))
+            return proc
+        return patch.object(BS.subprocess, "Popen", f)
+
+    def test_json_in_out_per_command(self):
+        for cmd, args, tool_out in (
+                ("auth", {}, {"ok": True, "data": {"logged_in": True, "scans_remaining": 4}}),
+                ("start", {"resume_path": "/r.pdf", "job_title": "T", "company": "C",
+                           "job_description": "JD", "scoring_guide": "Graduate - STEM Focus"},
+                 {"ok": True, "data": {"scan_id": "1", "state": "queued"}}),
+                ("status", {"scan_id": "1"}, {"ok": True, "data": {"state": "complete"}}),
+                ("feedback", {"scan_id": "1"}, {"ok": True, "data": {"medal": "gold"}}),
+                ("list", {"limit": 50, "cursor": None}, {"ok": True, "data": {"scans": []}}),
+                ("delete", {"scan_id": "1"}, {"ok": True, "data": {"deleted": True}})):
+            with self.popen(FakeProc(out="noise\n" + json.dumps(tool_out) + "\n")):
+                self.assertEqual(BS.call(cmd, **args), tool_out)
+            argv = self.argv[-1]
+            self.assertEqual(argv[:4], ["/usr/bin/uv", "--directory", str(self.mcp), "run"])
+            self.assertEqual(argv[6], cmd)
+            self.assertEqual(float(argv[argv.index("--timeout") + 1]),
+                             BS.TIMEOUT_S.get(cmd, BS.DEFAULT_TIMEOUT_S) - BS.INNER_MARGIN_S)
+            sent = json.loads(argv[argv.index("--json-args") + 1])
+            self.assertEqual(sent, {k: v for k, v in args.items() if v is not None})
+
+    def test_error_passthrough_with_hint(self):
+        e = {"ok": False, "error": {"code": "auth_expired", "message": "m", "hint": "run scripts/login.py"}}
+        with self.popen(FakeProc(out=json.dumps(e))):
+            self.assertEqual(BS.call("auth"), e)
+
+    def test_no_json_timeout_unknown_unavailable(self):
+        with self.popen(FakeProc(out="", err="Traceback\nModuleNotFoundError: mcp", rc=1)):
+            r = BS.call("auth")
+        self.assertEqual(r["error"]["code"], "internal_error")
+        self.assertIn("ModuleNotFoundError", r["error"]["hint"])
+        with self.popen(FakeProc(hang=True)), patch("claude_runner._kill_group") as kg:
+            r = BS.call("start", resume_path="/r.pdf")
+        self.assertEqual(r["error"]["code"], "timeout")
+        kg.assert_called_once()
+        self.assertEqual(BS.call("bogus")["error"]["code"], "invalid_input")
+        with patch.object(BS.subprocess, "Popen", side_effect=OSError("EAGAIN")):
+            r = BS.call("auth")
+        self.assertEqual(r["error"]["code"], "unavailable")
+        self.assertIn("EAGAIN", r["error"]["message"])
+        shutil.rmtree(self.mcp)
+        self.assertEqual(BS.call("auth")["error"]["code"], "unavailable")
+
+
+class TestBiScanServer(unittest.TestCase):
+    def run_main(self, argv, runner):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = BS.main(argv, runner=runner)
+        return rc, json.loads(buf.getvalue().strip().splitlines()[-1])
+
+    def test_maps_commands_to_tools(self):
+        seen = []
+        rc, out = self.run_main(["status", "--json-args", '{"scan_id": "9"}'],
+                                lambda tool, args: seen.append((tool, args)) or {"ok": True, "data": {}})
+        self.assertEqual((rc, out["ok"]), (0, True))
+        self.assertEqual(seen, [("get_scan_status", {"scan_id": "9"})])
+        self.assertEqual(set(BS.TOOLS.values()), {"auth_status", "start_scan", "get_scan_status",
+                                                  "get_scan_feedback", "list_scans", "delete_scan"})
+
+    def test_exception_and_bad_args(self):
+        def boom(tool, args):
+            raise RuntimeError("no browser")
+        rc, out = self.run_main(["auth"], boom)
+        self.assertEqual(out["error"]["code"], "internal_error")
+        self.assertTrue(out["error"]["hint"])
+        rc, out = self.run_main(["auth", "--json-args", "[1]"], boom)
+        self.assertEqual((rc, out["error"]["code"]), (2, "invalid_input"))
+
+    def test_inner_timeout_shuts_down(self):
+        import asyncio
+
+        async def hang(tool, args):
+            await asyncio.sleep(10)
+
+        buf = io.StringIO()
+        with patch.object(BS, "_run_tool", hang), contextlib.redirect_stdout(buf):
+            BS.main(["auth", "--timeout", "0.05"])
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["error"]["code"], "timeout")
+
+    def test_unwrap(self):
+        class R:
+            structuredContent = {"ok": True, "data": {"x": 1}}
+        self.assertEqual(BS._unwrap(R()), {"ok": True, "data": {"x": 1}})
+
+        class W:
+            structuredContent = {"result": {"ok": False, "error": {"code": "c"}}}
+        self.assertEqual(BS._unwrap(W())["error"]["code"], "c")
+
+        class C:
+            structuredContent = None
+            content = [type("T", (), {"text": '{"ok": true, "data": {}}'})()]
+        self.assertEqual(BS._unwrap(C()), {"ok": True, "data": {}})
+
+
 if __name__ == "__main__":
     unittest.main()
