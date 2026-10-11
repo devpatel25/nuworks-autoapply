@@ -161,6 +161,9 @@ RETAILOR_PROMPT = (
     "Keywords to integrate (each MUST appear naturally, placed only where the "
     "candidate's real experience supports it — never fabricate experience): {keywords}\n"
     "Corrections to apply: {corrections}\n"
+    "Candidate facts — use one ONLY when a picked correction asks for it, and never "
+    "invent any other fact: current GPA {gpa} (Northeastern University, MS Computer "
+    "Science); location for the header line: {location}.\n"
     "Change NOTHING else: keep every other bullet, skill line, project and section, "
     "the same density, the XYZ-format bullets, and every existing metric. Never invent "
     "a number. Do NOT change anything before \\begin{{document}} (preamble, geometry, "
@@ -337,6 +340,15 @@ def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
     return res
 
 
+def header_location(job: dict) -> str:
+    """Job posting's location for a location-matching correction ("City, State");
+    when the posting has no single place, the header stays unchanged."""
+    loc = re.sub(r",\s*United States$", "", (job.get("location") or "").strip())
+    if not loc or re.search(r"multiple|remote|various|anywhere", loc, re.I):
+        return "not available — leave the header location unchanged"
+    return loc
+
+
 def version_of(tex) -> int:
     """v1 lives in the job workdir; retailored versions in <workdir>/vN/."""
     m = re.fullmatch(r"v(\d+)", Path(tex).parent.name)
@@ -388,7 +400,9 @@ def retailor(job: dict, tex, picked_keywords: list, picked_corrections: list,
     prompt = RETAILOR_PROMPT.format(
         tex_name=tex.name,
         keywords=", ".join(picked_keywords) or "(none)",
-        corrections="; ".join(picked_corrections) or "(none)")
+        corrections="; ".join(picked_corrections) or "(none)",
+        gpa=resume_agents.agent_cfg("candidate_gpa"),
+        location=header_location(job))
     res = _run_phases(d, tex.name, prompt, d / "claude_retailor.log",
                       timeout, retries, reset=reset, find_tex=find_tex)
     if not res["ok"] and rejected and res["fail_code"] not in ("page_overflow", "compile_failed"):

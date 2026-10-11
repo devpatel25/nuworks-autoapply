@@ -269,6 +269,16 @@ class TestScoreKeywords(unittest.TestCase):
         self.assertTrue(RA.has_keyword("C++", "Languages: C++."))
         self.assertTrue(RA.has_keyword("C#", "C#, Java"))
 
+    def test_slash_terms_split_before_scoring(self):
+        jd = "Need JavaScript/TypeScript, ML/AI concepts, CI/CD, React and Git and SQL."
+        kw = {"must_have": ["JavaScript/TypeScript", "ML/AI concepts", "CI/CD", "React", "Git"],
+              "nice_to_have": ["SQL"]}
+        r = RA.score_keywords(kw, jd, {"B": "JavaScript, TypeScript, Machine Learning, Git"})
+        self.assertEqual(r["keywords"]["must_have"],
+                         ["JavaScript", "TypeScript", "Machine Learning", "AI concepts", "CI/CD", "React", "Git"])
+        self.assertEqual(r["must_hit"], 4)
+        self.assertEqual(RA.split_slash("CI/CD"), ["CI/CD"])
+
     def test_better_of_two_bases(self):
         kw = {"must_have": ["Python", "AWS", "Kubernetes", "Terraform", "Java"], "nice_to_have": []}
         r = RA.score_keywords(kw, self.JD, {"SWE.tex": "Python, Java",
@@ -363,7 +373,7 @@ class TailorBase(unittest.TestCase):
         T.INSTRUCTIONS = self.tpl / "system_instructions.md"
         T.BASE_OVERRIDES.clear()
         self.job = {"job_id": "abcdef123", "title": "ML Intern", "company": "Foo",
-                    "description": "Python AWS"}
+                    "description": "Python AWS", "location": "Boston, MA, United States"}
         self.prompts = []
         p1 = patch.object(T, "compile_tex", side_effect=self.fake_compile)
         p2 = patch.object(T.time, "sleep", lambda *_: None)
@@ -460,6 +470,8 @@ class TestRetailor(TailorBase):
         self.assertEqual(Path(r["tex"]).parent.name, "v2")
         self.assertEqual(self.v1.read_text(), make_tex())          # v1 kept unchanged
         p = self.prompts[0]
+        self.assertIn("current GPA 3.93/4", p)
+        self.assertIn("location for the header line: Boston, MA", p)
         self.assertIn("Keywords to integrate", p)
         self.assertIn("Kubernetes", p)
         self.assertIn("Quantify impact", p)
@@ -478,6 +490,12 @@ class TestRetailor(TailorBase):
         self.assertEqual(r["fail_code"], "edit_rejected")
         self.assertEqual(cl.call_count, T.max_total_attempts() - T.ESCALATION_ATTEMPTS)
         self.assertEqual(self.v1.read_text(), make_tex())
+
+    def test_header_location(self):
+        self.assertEqual(T.header_location({"location": "Boston, Massachusetts, United States"}),
+                         "Boston, Massachusetts")
+        for loc in ("Multiple Locations", "", "Remote"):
+            self.assertIn("unchanged", T.header_location({"location": loc}))
 
     def test_nothing_picked(self):
         with patch.object(T.claude_runner, "run_claude_p") as cl:
@@ -513,7 +531,7 @@ class TestPostingCard(unittest.TestCase):
         t = TB.posting_card_text(JOB)
         for frag in ("🆕 New posting", "<b>ML Co-op</b>", "Acme", "💵 Pay: $500 per week",
                      "📅 Posted: 2026-10-10", "🗓 Apply by: 2026-10-20",
-                     "🌐 External apply: No", "currentJobId=" + "a" * 32):
+                     "🌐 External apply: No", "/students/app/jobs/detail/" + "a" * 32):
             self.assertIn(frag, t)
         self.assertNotIn("Boston", t)                     # location dropped
         t2 = TB.posting_card_text({**JOB, "apply_urls": "https://x.io/a; https://y.io/b",
@@ -522,12 +540,9 @@ class TestPostingCard(unittest.TestCase):
         self.assertIn("Pay: Not listed", t2)
         self.assertIn("Posted: —", t2)
 
-    def test_posting_url_matches_apply(self):
-        try:
-            import auto_apply
-        except ImportError:
-            self.skipTest("playwright not installed")
-        self.assertEqual(TB.job_posting_url("123"), auto_apply.job_url("123"))
+    def test_posting_url_is_detail_page(self):
+        self.assertEqual(TB.job_posting_url("123"),
+                         "https://northeastern-csm.symplicity.com/students/app/jobs/detail/123")
 
     def test_callback_data_fits_64_bytes(self):
         n = "abcd1234"

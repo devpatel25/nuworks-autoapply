@@ -171,12 +171,11 @@ PORTAL_BASE = "https://northeastern-csm.symplicity.com"
 
 
 def job_posting_url(job_id: str) -> str:
-    """Deep link that opens the posting's detail pane — the same URL auto_apply.job_url()
-    navigates to (proven against the live portal). ponytail: duplicated, not imported,
-    so telegram_bot doesn't pull in Playwright; a test keeps the two in sync."""
-    return (f"{PORTAL_BASE}/students/app/jobs/search?perPage=20&page=1&sort=!postdate"
-            f"&ocr=f&job_type=5,17&targeted_academic_majors=0160"
-            f"&currentJobId={job_id}")
+    """The posting's own detail page. Verified against the live portal 2026-10-11: with
+    a NUworks session it opens exactly that job (the search?currentJobId= link that
+    auto_apply uses lands on the full job list instead). Without a session NUworks
+    sends you to its sign-in page first."""
+    return f"{PORTAL_BASE}/students/app/jobs/detail/{job_id}"
 
 
 def posting_card_text(job: dict) -> str:

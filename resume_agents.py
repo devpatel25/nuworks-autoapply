@@ -49,6 +49,7 @@ AGENT_DEFAULTS = {
     "retailor_max_rounds": 3,
     "bi_correction_categories": ["credibility", "ats_fit"],
     "bi_max_toggles": 20,
+    "candidate_gpa": "3.93/4",
 }
 
 
@@ -328,6 +329,17 @@ SYNONYMS = {
 }
 
 
+# Slash terms that are ONE skill; every other "A/B" keyword (e.g. "JavaScript/TypeScript",
+# "ML/AI concepts") is split into its parts before scoring.
+NO_SPLIT = {"ci/cd", "tcp/ip", "i/o", "pl/sql", "a/b testing", "a/b", "ui/ux"}
+
+
+def split_slash(k: str) -> list:
+    if "/" not in k or k.strip().lower() in NO_SPLIT:
+        return [k]
+    return [p.strip() for p in k.split("/") if p.strip()]
+
+
 def _canon(k: str) -> str:
     return SYNONYMS.get(k.strip().lower(), k.strip())
 
@@ -377,7 +389,7 @@ def score_keywords(kw: dict, jd_text: str, base_texts: dict) -> dict:
     keywords, dropped, per_base}."""
     dropped, must, nice, seen = [], [], [], set()
     for bucket, src in ((must, kw.get("must_have", [])), (nice, kw.get("nice_to_have", []))):
-        for k in src:
+        for k in (part for term in src for part in split_slash(term)):
             if not has_term(k, jd_text):          # Haiku can't invent requirements
                 dropped.append(k)
                 continue
