@@ -459,9 +459,12 @@ class CallbackDispatcher:
     (action 'tg') go to a registered handler instead (message edited in place). Taps
     for an unknown / finished (job_id, nonce) are acked as expired and dropped."""
 
+    ORPHAN_GRACE_S = 10  # a tap may beat its waiter's registration; hold it this long
+
     def __init__(self):
         self._queues: dict = {}
         self._toggles: dict = {}
+        self._orphans: dict = {}  # (job_id, nonce) -> [(action, cq, t)] not yet claimed
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -472,8 +475,28 @@ class CallbackDispatcher:
         return self._thread is not None and self._thread.is_alive()
 
     def expect(self, job_id: str, nonce: str) -> "queue.Queue":
+        key = (str(job_id), nonce)
         with self._lock:
-            return self._queues.setdefault((str(job_id), nonce), queue.Queue())
+            q = self._queues.setdefault(key, queue.Queue())
+            for action, cq, _ in self._orphans.pop(key, []):
+                q.put((action, cq))  # tap arrived before the waiter registered
+            return q
+
+    def sweep(self, now: float = None):
+        """Ack orphaned taps older than the grace period as expired."""
+        now = time.time() if now is None else now
+        with self._lock:
+            stale = []
+            for key, taps in list(self._orphans.items()):
+                keep = [t for t in taps if now - t[2] < self.ORPHAN_GRACE_S]
+                stale += [t for t in taps if now - t[2] >= self.ORPHAN_GRACE_S]
+                if keep:
+                    self._orphans[key] = keep
+                else:
+                    self._orphans.pop(key)
+        for action, cq, _ in stale:
+            answer_callback(cq["id"], EXPIRED if action in ACK_TEXT else
+                            "This card is no longer active.")
 
     def on_toggle(self, job_id: str, nonce: str, handler):
         with self._lock:
@@ -503,8 +526,11 @@ class CallbackDispatcher:
                 answer_callback(cq["id"], "Not selectable.")
             return
         if q is None:
-            answer_callback(cq["id"], EXPIRED if action in ACK_TEXT else
-                            "This card is no longer active.")
+            # Unknown card: maybe its waiter hasn't registered yet (a card sent
+            # without _expect, e.g. external_autofill's). Hold briefly; sweep()
+            # acks it as expired if nobody claims it.
+            with self._lock:
+                self._orphans.setdefault(key, []).append((action, cq, time.time()))
             return
         q.put((action, cq))
 
@@ -535,7 +561,8 @@ class CallbackDispatcher:
 
         def loop():
             while not self._stop.is_set():
-                self.poll_once()
+                self.poll_once(poll_timeout=5)  # short polls so orphans get swept
+                self.sweep()
 
         self._thread = threading.Thread(target=loop, name="tg-dispatcher", daemon=True)
         self._thread.start()
@@ -545,6 +572,7 @@ class CallbackDispatcher:
         if self._thread:
             self._thread.join(timeout=45)
         self._thread = None
+        self.sweep(now=float("inf"))  # clear any spinners still held
         _commit_offset(self.offset)  # don't replay processed taps next run
 
 

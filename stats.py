@@ -138,6 +138,6 @@ def record_run(jobs: list[dict], results: list[dict], marked: bool):
         elif r.get("system_failure"):
             _add(t["errors"], {"job": job, "reason": res})
         elif res in ("reject", "timeout", "cover_letter_rejected",
-                     "cover_letter_timeout", "no_telegram"):
+                     "cover_letter_timeout", "no_telegram", "skipped_low_match"):
             _add(t["skipped"], {"job": job, "reason": res})
     _save(today_path(), t)

@@ -58,7 +58,8 @@ MAX_RETRY_ATTEMPTS, MAX_DIAGNOSES_PER_RUN = _cfg()
 
 # NUworks apply taxonomy (see auto_apply.py + pipeline.py process()).
 SUCCESS = {"applied", "already_applied", "staged"}
-BENIGN = {"reject", "cover_letter_rejected", "no_inportal_apply", "external", "no_telegram"}
+BENIGN = {"reject", "cover_letter_rejected", "no_inportal_apply", "external", "no_telegram",
+          "skipped_low_match"}
 DEFERRALS = {"timeout", "cover_letter_timeout", "cap_reached"}   # pure deferrals; never count toward the cap
 AUTO_RETRY_CLASSES = {"transient", "verify_gap"}                 # reversible: stay queued, retry next run
 _VALID_CLASSES = {"transient", "structural", "data_gap", "code_break", "auth_challenge", "verify_gap"}
@@ -138,7 +139,7 @@ def pre_classify(status: str, attempts: int = 0) -> str:
         return "verify_gap" if attempts < 2 else "code_break"
     if status == "blocked_missing_documents":
         return "data_gap"
-    if status in ("error", "crashed", "tailor_failed", "cover_letter_failed"):
+    if status in ("error", "crashed", "tailor_failed", "cover_letter_failed", "postcheck_failed"):
         return "transient" if attempts < 1 else "code_break"
     if status in DEFERRALS:
         return "transient"

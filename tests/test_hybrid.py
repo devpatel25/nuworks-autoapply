@@ -554,7 +554,17 @@ class TestDispatcher(unittest.TestCase):
         q = self.d.expect("A", "new")
         self.d.route(cq("approve:A:old", 9))
         self.assertTrue(q.empty())
+        self.assertEqual(self.acks, [])                         # held for the grace period
+        self.d.sweep(now=TB.time.time() + 11)
         self.assertEqual(self.acks, [("cq9", TB.EXPIRED)])
+        self.d.expect("A", "old")                               # too late — not delivered
+        self.assertTrue(self.d._queues[("A", "old")].empty())
+
+    def test_tap_before_registration_is_delivered(self):
+        self.d.route(cq("approve:X:n", 3))                      # card sent w/o _expect
+        q = self.d.expect("X", "n")
+        self.assertEqual(q.get_nowait()[0], "approve")
+        self.assertEqual(self.acks, [])
 
     def test_toggle_goes_to_handler(self):
         got = []
@@ -745,6 +755,394 @@ class TestLowMatchCard(unittest.TestCase):
         self.assertIn("Missing: Kubernetes, Terraform", sent["t"])
         self.assertEqual([b["callback_data"].split(":")[0] for b in sent["kb"]["inline_keyboard"][0]],
                          ["lowok", "lowno"])
+
+
+# ── Phase 4: pipeline wiring ─────────────────────────────────────────────────
+import threading  # noqa: E402
+import pipeline as P  # noqa: E402
+
+
+class PipeBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._files = (P.PENDING_FILE, P.SKIP_FILE, P.SCANS_FILE, P.SCAN_RESET_STAMP)
+        P.PENDING_FILE = self.tmp / "pending.json"
+        P.SKIP_FILE = self.tmp / "skip.txt"
+        P.SCANS_FILE = self.tmp / "scans.json"
+        P.SCAN_RESET_STAMP = self.tmp / "reset.txt"
+        self.msgs = []
+        for target, attr, val in ((P, "log", lambda m: None),
+                                  (P, "_msg", lambda t: self.msgs.append(t)),
+                                  (P.time, "sleep", lambda s: self.sleeps.append(s)),
+                                  (P, "bump_watchdog", lambda x: None)):
+            pt = patch.object(target, attr, val); pt.start(); self.addCleanup(pt.stop)
+        self.sleeps = []
+        self.job = {"job_id": "j1", "title": "ML Co-op", "company": "Acme",
+                    "description": "Python AWS", "apply_urls": ""}
+
+    def tearDown(self):
+        P.PENDING_FILE, P.SKIP_FILE, P.SCANS_FILE, P.SCAN_RESET_STAMP = self._files
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TestRunPostings(PipeBase):
+    def test_send_all_then_approve_starts_while_other_pending(self):
+        sent, order = [], []
+        b_released = threading.Event()
+
+        def wait(jid, nonce="", timeout=0, refuse=None):
+            if jid == "A":
+                return "approve"
+            b_released.wait(5)          # B's card stays pending until A's job has started
+            order.append("B-decided")
+            return "timeout"
+
+        def run_job(job, ctx, dry):
+            order.append(f"{job['job_id']}-started")
+            b_released.set()
+            return P._result(job, "applied")
+
+        with patch.object(P.tg.DISPATCHER, "start", lambda: None), \
+             patch.object(P.tg.DISPATCHER, "stop", lambda: None), \
+             patch.object(P.tg, "send_job_for_approval", lambda j, nonce="": sent.append(j["job_id"])), \
+             patch.object(P.tg, "wait_for_decision", wait), \
+             patch.object(P, "_run_job", run_job):
+            res = P.run_postings([{"job_id": "A", "title": "a"}, {"job_id": "B", "title": "b"}], {}, True)
+        self.assertEqual(sent, ["A", "B"])                       # all cards sent up front
+        self.assertEqual(order, ["A-started", "B-decided"])
+        self.assertEqual(sorted(r["result"] for r in res), ["applied", "timeout"])
+        self.assertEqual([p["job_id"] for p in P.load_pending()], ["B"])
+
+    def test_reject_skiplists(self):
+        with patch.object(P.tg.DISPATCHER, "start", lambda: None), \
+             patch.object(P.tg.DISPATCHER, "stop", lambda: None), \
+             patch.object(P.tg, "send_job_for_approval", lambda j, nonce="": 1), \
+             patch.object(P.tg, "wait_for_decision", lambda *a, **k: "reject"), \
+             patch.object(P, "_run_job") as rj:
+            res = P.run_postings([{"job_id": "A", "title": "a"}], {}, True)
+        rj.assert_not_called()                                  # no LLM work on reject
+        self.assertEqual(res[0]["result"], "reject")
+        self.assertIn("A", P.load_skiplist())
+
+
+class TestAuditGate(PipeBase):
+    def test_red_stops_with_one_alert(self):
+        red = {"A.tex": {"status": "red", "usable_tex": None, "report": {"failed": ["contact_found"]}},
+               "B.tex": {"status": "green", "usable_tex": "x", "report": {"failed": []}}}
+        with patch.object(P.ra, "audit_bases_cached", return_value=red):
+            self.assertIsNone(P.audit_or_stop())
+        self.assertEqual(len(self.msgs), 1)
+        self.assertIn("contact_found", self.msgs[0])
+
+    def test_yellow_sets_override(self):
+        fixed = self.tmp / "fixed.tex"; fixed.write_text("REPAIRED")
+        green = self.tmp / "g.tex"; green.write_text("G")
+        audit = {"A.tex": {"status": "yellow", "usable_tex": str(fixed), "report": {}},
+                 "B.tex": {"status": "green", "usable_tex": str(green), "report": {}}}
+        saved = dict(P.tailor.BASE_OVERRIDES)
+        try:
+            with patch.object(P.ra, "audit_bases_cached", return_value=audit):
+                ctx = P.audit_or_stop()
+            self.assertEqual(P.tailor.BASE_OVERRIDES, {"A.tex": str(fixed)})
+            self.assertEqual(ctx["base_texts"], {"A.tex": "REPAIRED", "B.tex": "G"})
+        finally:
+            P.tailor.BASE_OVERRIDES.clear(); P.tailor.BASE_OVERRIDES.update(saved)
+
+
+class TestRunJob(PipeBase):
+    def setUp(self):
+        super().setUp()
+        d = self.tmp / "work"; d.mkdir()
+        (d / "job_description.txt").write_text("Python AWS Kubernetes Terraform Go Java")
+        self.pdf = self.tmp / "r.pdf"; self.pdf.write_bytes(b"%PDF")
+        self.tex = self.tmp / "r.tex"; self.tex.write_text(make_tex())
+        self.ctx = {"audit": {}, "base_texts": {"B": "Python"}}
+        self.calls = {}
+        for target, attr, val in (
+                (P.tailor, "stage", lambda j: d),
+                (P.tailor, "latest_pdf", lambda j: None),
+                (P, "_scan_button", lambda: None),
+                (P.ra, "verify_tailored_pdf",
+                 lambda pdf, tex, kw: {"ok": True, "notes": [], "failed": [], "kw_in_final": 1, "kw_total": 1}),
+                (P, "_apply", lambda job, pdf, dry: P._result(job, "applied", extra={"resume": pdf})),
+                (P.tg, "send_resume_for_approval", lambda *a, **k: 1),
+                (P.tg, "send_low_match_card", lambda *a, **k: self.calls.setdefault("low", True))):
+            pt = patch.object(target, attr, val); pt.start(); self.addCleanup(pt.stop)
+
+    def tailor_ok(self, job, keywords=None):
+        self.calls["kw"] = keywords
+        return {"ok": True, "pdf": str(self.pdf), "tex": str(self.tex), "attempts": 1,
+                "model": "claude-sonnet-4-6", "version": 1}
+
+    def kw(self, must):
+        return {"must_have": must, "nice_to_have": []}
+
+    def test_low_match_skip(self):
+        with patch.object(P.ra, "extract_keywords",
+                          return_value=self.kw(["Python", "AWS", "Kubernetes", "Terraform", "Go", "Java"])), \
+             patch.object(P.tg, "wait_for_decision", return_value="lowno"), \
+             patch.object(P.tailor, "tailor_with_claude") as tw:
+            r = P._run_job(self.job, {"audit": {}, "base_texts": {"B": "nothing here"}}, True)
+        self.assertEqual(r["result"], "skipped_low_match")
+        self.assertTrue(self.calls.get("low"))
+        tw.assert_not_called()                                 # no tailor spend
+        self.assertIn("j1", P.load_skiplist())
+
+    def test_low_match_timeout_pending(self):
+        with patch.object(P.ra, "extract_keywords",
+                          return_value=self.kw(["Python", "AWS", "Kubernetes", "Terraform", "Go", "Java"])), \
+             patch.object(P.tg, "wait_for_decision", return_value="timeout"):
+            r = P._run_job(self.job, {"audit": {}, "base_texts": {"B": "nothing"}}, True)
+        self.assertEqual(r["result"], "timeout")
+        self.assertEqual(P.load_pending()[0]["_last_detail"], "no low-match tap in time")
+        self.assertNotIn("system_failure", r)
+
+    def test_haiku_failure_degrades_and_approve_applies(self):
+        with patch.object(P.ra, "extract_keywords", return_value={"error": "x"}), \
+             patch.object(P.tailor, "tailor_with_claude", side_effect=self.tailor_ok), \
+             patch.object(P.tg, "wait_for_decision", return_value="approve"):
+            r = P._run_job(self.job, self.ctx, True)
+        self.assertIsNone(self.calls["kw"])                    # tailor extracts its own
+        self.assertNotIn("low", self.calls)
+        self.assertEqual(r["result"], "applied")
+        self.assertEqual(r["resume"], str(self.pdf))
+
+    def test_keywords_passed_to_tailor(self):
+        with patch.object(P.ra, "extract_keywords",
+                          return_value=self.kw(["Python", "AWS", "Kubernetes", "Terraform", "Go"])), \
+             patch.object(P.tailor, "tailor_with_claude", side_effect=self.tailor_ok), \
+             patch.object(P.tg, "wait_for_decision", side_effect=["lowok", "approve"]):
+            P._run_job(self.job, self.ctx, True)
+        self.assertEqual(self.calls["kw"]["must_have"], ["Python", "AWS", "Kubernetes", "Terraform", "Go"])
+        self.assertEqual(self.calls["kw"]["covered"], ["Python"])
+
+    def test_postcheck_failed_is_system_failure(self):
+        with patch.object(P.ra, "extract_keywords", return_value={"error": "x"}), \
+             patch.object(P.tailor, "tailor_with_claude", side_effect=self.tailor_ok), \
+             patch.object(P.ra, "verify_tailored_pdf",
+                          return_value={"ok": False, "failed": ["contact_found"], "notes": []}), \
+             patch.object(P, "_alert_failure") as al, \
+             patch.object(P.tg, "send_resume_for_approval") as send:
+            r = P._run_job(self.job, self.ctx, True)
+        self.assertEqual(r["result"], "postcheck_failed")
+        self.assertTrue(r["system_failure"])
+        self.assertFalse(self.pdf.exists())                   # quarantined → not reused
+        self.assertTrue((self.tmp / "POSTCHECK_FAILED_r.pdf").exists())
+        al.assert_called_once()
+        send.assert_not_called()                               # never sent for approval
+
+    def test_tailor_failure_alerts(self):
+        with patch.object(P.ra, "extract_keywords", return_value={"error": "x"}), \
+             patch.object(P.tailor, "tailor_with_claude",
+                          return_value={"ok": False, "fail_code": "timeout", "fail_reason": "r"}), \
+             patch.object(P, "_alert_failure") as al:
+            r = P._run_job(self.job, self.ctx, True)
+        self.assertEqual(r["result"], "tailor_failed")
+        self.assertTrue(r["system_failure"])
+        al.assert_called_once()
+
+    def test_scan_loop_then_approve_submits_new_version(self):
+        v2 = {"pdf": str(self.tmp / "v2.pdf"), "tex": str(self.tex), "version": 2, "round": 1,
+              "prev_scan": "x", "verdict": "v", "match": None, "kw": None}
+        with patch.object(P.ra, "extract_keywords", return_value={"error": "x"}), \
+             patch.object(P.tailor, "tailor_with_claude", side_effect=self.tailor_ok), \
+             patch.object(P.tailor, "consolidate") as cons, \
+             patch.object(P, "_scan_and_retailor", return_value=v2), \
+             patch.object(P.tg, "wait_for_decision", side_effect=["scan", "approve"]):
+            r = P._run_job(self.job, self.ctx, True)
+        self.assertEqual(r["resume"], v2["pdf"])               # approved card's version
+        cons.assert_called_once()
+
+
+def env(data=None, err=None):
+    return {"ok": False, "error": err} if err else {"ok": True, "data": data or {}}
+
+
+class FakeBI:
+    def __init__(self, script):
+        self.script, self.calls = script, []
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(cmd)
+        v = self.script[cmd]
+        return v.pop(0) if isinstance(v, list) else v
+
+
+class TestScan(PipeBase):
+    ST = {"pdf": "/tmp/r.pdf", "tex": "/tmp/r.tex", "version": 1, "round": 0, "prev_scan": "",
+          "verdict": "v", "match": None, "kw": None}
+    AUTH = env({"logged_in": True, "scans_remaining": 3})
+
+    def test_poll_interval_at_least_20s_and_feedback(self):
+        bi = FakeBI({"auth": self.AUTH,
+                     "start": env({"scan_id": "s1", "state": "queued", "scans_remaining": 2}),
+                     "status": [env({"state": "scanning"}), env({"state": "complete", "scans_remaining": 2})],
+                     "feedback": env({"scan_id": "s1", "medal": "gold"})})
+        with patch.object(P, "_bi", bi), patch.object(P.ra, "agent_cfg",
+                                                      lambda k: 1 if k == "bi_poll_s" else RA.AGENT_DEFAULTS[k]):
+            fb, left, err = P._run_scan(self.job, self.ST)
+        self.assertIsNone(err)
+        self.assertEqual(fb["medal"], "gold")
+        self.assertTrue(self.sleeps and all(s >= 20 for s in self.sleeps))
+
+    def test_timeout_after_10_min(self):
+        bi = FakeBI({"auth": self.AUTH, "start": env({"scan_id": "s1", "state": "scanning"}),
+                     "status": env({"state": "scanning"})})
+        clock = [0.0]
+        with patch.object(P, "_bi", bi), patch.object(P.time, "time", lambda: clock[0]), \
+             patch.object(P.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)):
+            fb, left, err = P._run_scan(self.job, self.ST)
+        self.assertIn("timed out", err)
+        self.assertIn("s1", err)
+        self.assertLessEqual(bi.calls.count("status"), 600 // 20)
+
+    def test_unknown_not_retried(self):
+        bi = FakeBI({"auth": self.AUTH, "start": env({"scan_id": "s1", "state": "scanning"}),
+                     "status": [env({"state": "unknown", "hint": "snapshot at /x"})]})
+        with patch.object(P, "_bi", bi):
+            fb, left, err = P._run_scan(self.job, self.ST)
+        self.assertEqual(bi.calls.count("status"), 1)
+        self.assertIn("not retrying", err)
+        self.assertIn("snapshot at /x", err)
+
+    def test_login_expired_and_mcp_error_hint(self):
+        with patch.object(P, "_bi", FakeBI({"auth": env({"logged_in": False})})):
+            self.assertIn("login expired", P._run_scan(self.job, self.ST)[2])
+        err = {"code": "profile_in_use", "message": "busy", "hint": "close the other app"}
+        bi = FakeBI({"auth": self.AUTH, "start": env(err=err)})
+        with patch.object(P, "_bi", bi):
+            msg = P._run_scan(self.job, self.ST)[2]
+        self.assertIn("profile_in_use", msg)
+        self.assertIn("close the other app", msg)
+        self.assertEqual(bi.calls, ["auth", "start"])           # never retried
+
+    def test_scan_failure_returns_same_card_state(self):
+        with patch.object(P, "_run_scan", return_value=(None, None, "boom")):
+            self.assertIs(P._scan_and_retailor(self.job, {}, self.ST), self.ST)
+        self.assertIn("boom", self.msgs)
+
+    def test_scan_lock_no_overlap(self):
+        live, peak = [0], [0]
+        lock = threading.Lock()
+
+        def slow_scan(job, st):
+            with lock:
+                live[0] += 1; peak[0] = max(peak[0], live[0])
+            import time as _t; _t.sleep(0.05)
+            with lock:
+                live[0] -= 1
+            return None, None, "done"
+
+        with patch.object(P, "_run_scan", slow_scan):
+            ts = [threading.Thread(target=P._scan_and_retailor, args=(self.job, {}, self.ST))
+                  for _ in range(3)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(peak[0], 1)
+
+
+class TestLimitReset(PipeBase):
+    SCANS = [{"scan_id": f"s{i}", "scanned_at": f"2026-10-{10 - i:02d}T00:00:00"} for i in range(8)] + \
+            [{"scan_id": "undated", "scanned_at": None}]
+
+    def bi(self, restored):
+        return FakeBI({"list": env({"scans": self.SCANS, "next_cursor": None}),
+                       "delete": env({"deleted": True, "backup_path": "/b"}),
+                       "auth": env({"logged_in": True, "scans_remaining": 5 if restored else 0})})
+
+    def test_deletes_exactly_5_oldest(self):
+        bi = self.bi(True)
+        deleted = []
+        orig = bi.__call__
+
+        def rec(cmd, **kw):
+            if cmd == "delete":
+                deleted.append(kw["scan_id"])
+            return orig(cmd, **kw)
+
+        with patch.object(P, "_bi", rec):
+            ok, msg, left = P._limit_reset()
+        self.assertTrue(ok)
+        self.assertEqual(left, 5)
+        self.assertEqual(deleted, ["s7", "s6", "s5", "s4", "s3"])   # oldest first; undated never
+
+    def test_not_restored_stops_and_never_twice_a_day(self):
+        bi = self.bi(False)
+        with patch.object(P, "_bi", bi):
+            ok, msg, left = P._limit_reset()
+            self.assertFalse(ok)
+            self.assertIn("did not reset", msg)
+            ok2, msg2, _ = P._limit_reset()
+        self.assertFalse(ok2)
+        self.assertIn("already ran", msg2)
+        self.assertEqual(bi.calls.count("delete"), 5)            # second call deleted nothing
+
+
+class TestRetailorFlow(PipeBase):
+    ST = TestScan.ST
+
+    def card_patch(self, picked=(["Kubernetes"], [])):
+        class Card:
+            selectable = [{"kind": "keyword", "text": "Kubernetes"}]
+
+            def picked(self_inner):
+                return picked
+
+            def refuse(self_inner, a):
+                return None
+        return patch.object(P.tg, "send_score_card", lambda *a, **k: Card())
+
+    def test_retailor_failure_falls_back(self):
+        tex = self.tmp / "r.tex"; tex.write_text("x")
+        st = {**self.ST, "tex": str(tex)}
+        with patch.object(P, "_run_scan", return_value=({"scan_id": "s", "medal": "silver"}, 2, None)), \
+             self.card_patch(), patch.object(P.tg, "wait_for_decision", return_value="retailor"), \
+             patch.object(P.tailor, "retailor", return_value={"ok": False, "fail_code": "timeout",
+                                                               "fail_reason": "slow", "version": 2}):
+            out = P._scan_and_retailor(self.job, {}, st)
+        self.assertIs(out, st)
+        self.assertTrue(any("Retailor failed" in m for m in self.msgs))
+
+    def test_retailor_success_new_version_and_round(self):
+        tex = self.tmp / "r.tex"; tex.write_text("x")
+        st = {**self.ST, "tex": str(tex)}
+        new_res = {"ok": True, "pdf": "/v2.pdf", "tex": str(tex), "version": 2, "attempts": 1,
+                   "model": "claude-sonnet-4-6"}
+        fb = {"scan_id": "s", "medal": "silver", "categories": {"ats_fit": {"badge": "bronze"}}}
+        with patch.object(P, "_run_scan", return_value=(fb, 2, None)), self.card_patch(), \
+             patch.object(P.tg, "wait_for_decision", return_value="retailor"), \
+             patch.object(P.tailor, "retailor", return_value=new_res) as rt, \
+             patch.object(P.ra, "verify_tailored_pdf", return_value={"ok": True, "notes": [], "failed": []}):
+            out = P._scan_and_retailor(self.job, {"audit": {}, "base_texts": {}}, st)
+        self.assertEqual((out["version"], out["round"]), (2, 1))
+        self.assertEqual(out["prev_scan"], "🥈 Silver · ATS Fit: 🥉 Bronze")
+        self.assertEqual(rt.call_args.args[2:], (["Kubernetes"], []))   # only ticked items
+        rows = json.loads(P.SCANS_FILE.read_text())
+        self.assertEqual(rows[0]["items"], [{"kind": "keyword", "text": "Kubernetes"}])
+
+    def test_back_and_timeout(self):
+        with patch.object(P, "_run_scan", return_value=({"scan_id": "s"}, 2, None)), self.card_patch():
+            with patch.object(P.tg, "wait_for_decision", return_value="back"):
+                self.assertIs(P._scan_and_retailor(self.job, {}, self.ST), self.ST)
+            with patch.object(P.tg, "wait_for_decision", return_value="timeout"):
+                self.assertEqual(P._scan_and_retailor(self.job, {}, self.ST), "timeout")
+
+
+class TestPendingConcurrency(PipeBase):
+    def test_concurrent_adds_not_lost(self):
+        jobs = [{"job_id": f"j{i}", "title": "t"} for i in range(20)]
+        ts = [threading.Thread(target=P.add_pending, args=(j,)) for j in jobs]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(len(P.load_pending()), 20)
+
+    def test_external_autofill_shares_telegram_module(self):
+        self.assertIs(P.external_autofill.tg, P.tg)
+
+
+class TestSupervisorKnowsNewResults(unittest.TestCase):
+    def test_sets(self):
+        import supervisor as S
+        self.assertIn("skipped_low_match", S.BENIGN)
+        self.assertEqual(S.pre_classify("postcheck_failed", 0), "transient")
 
 
 if __name__ == "__main__":
