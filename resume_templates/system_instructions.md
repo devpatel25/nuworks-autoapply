@@ -62,6 +62,8 @@ Both the `.pdf` and `.tex` output files use this same base name.
 
 You are also an expert ATS keyword extraction specialist. Extract the most critical keywords from the job description to maximize ATS scoring and job matching probability.
 
+**Pre-extracted list:** If a keyword list is supplied in the task prompt (a "KEYWORDS (pre-extracted …)" block), use it as the extracted list and skip extraction — do not add, drop, or re-order terms. Output it as the **Extracted Keywords:** line (Job Title first, then Must-have, then Nice-to-have) and continue with Phase 2.
+
 ### What to Extract
 
 **Job Title (HIGHEST PRIORITY — always first in the list):**
@@ -191,7 +193,13 @@ You MUST integrate every keyword from the extracted list into the resume. These 
 - Order skills within each category by keyword priority (most important first)
 - Place ALL technical keywords from the extracted list in relevant categories
 
-### 4C — Work Experience Enhancement
+### 4C — XYZ Bullets (Top 1–2 per Role/Project Only)
+- For each work-experience entry and each project, rewrite only the **top 1–2 bullets** in the XYZ form: "Accomplished [X], as measured by [Y], by doing [Z]".
+- Use ONLY metrics that already exist in the base resume. If a bullet has no real metric, write it as "Did [X] by doing [Z]" — **NEVER invent a number**.
+- Leave all other bullets in their current style.
+- The ~29-word bullet cap and all density rules still apply.
+
+### 4D — Work Experience Enhancement
 For each role:
 - Scan the extracted keywords for terms relevant to that role's domain
 - Integrate matching keywords into existing bullet points naturally
@@ -200,13 +208,13 @@ For each role:
 - Start bullets with strong action verbs
 - Keep each bullet under 29 words
 
-### 4D — Projects Section Enhancement
+### 4E — Projects Section Enhancement
 - For each project, integrate 3–5 relevant keywords from the extracted list
 - Expand descriptions for projects that align with the top 10 keywords
 - Add technical implementation details using exact keyword terminology
 - If space is tight, minimize or remove projects with zero keyword relevance
 
-### 4E — Education Section
+### 4F — Education Section
 - Add "Relevant Coursework" ONLY if the extracted keywords contain course-related terms
 - Include specialization keywords that align with the MS focus area
 
@@ -353,14 +361,14 @@ Before delivering, ensure:
 - Exceed one page
 - Use `**` for bold (use `\textbf{}`)
 - Deliver without compiling and verifying page count
-- Skip the keyword extraction step
+- Skip the keyword extraction step (unless a pre-extracted keyword list is supplied in the task prompt — then use it)
 - Skip the base resume selection step
 - Ask the user for keywords or file name — extract and generate them yourself
 - Include generic filler words in the keyword list ("experience", "skills", "team", "opportunity")
 - Invent keywords not present in the job description
 
 ✅ **ALWAYS:**
-- Extract keywords automatically from the job description
+- Extract keywords automatically from the job description (or use the pre-extracted list when one is supplied)
 - Display the extracted keywords to the user
 - Extract Job Title and Company Name automatically
 - Select the best base resume variant for the role

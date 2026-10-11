@@ -342,5 +342,159 @@ class TestVerifyAndVerdict(unittest.TestCase):
         self.assertEqual(RA.detect_base(a + "\nnew tailored line here ok", {"A": a, "B": b}), "A")
 
 
+# ── Phase 2: tailor ──────────────────────────────────────────────────────────
+import tailor as T  # noqa: E402
+
+TODAY_PROMPT_HEAD = "Read job_description.txt in this directory. Following your resume "
+TODAY_PROMPT_TAIL = ("compilation and one-page verification are handled automatically "
+                     "after you finish.")
+
+
+class TailorBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.tpl = self.tmp / "tpl"
+        self.tpl.mkdir()
+        for b in T.BASE_VARIANTS:
+            (self.tpl / b).write_text(make_tex())
+        (self.tpl / "system_instructions.md").write_text("SYS")
+        self._saved = (T.RESUMEBOT, T.APPS, T.RESUMES, T.INSTRUCTIONS, dict(T.BASE_OVERRIDES))
+        T.RESUMEBOT, T.APPS, T.RESUMES = self.tpl, self.tmp / "apps", self.tmp / "resumes"
+        T.INSTRUCTIONS = self.tpl / "system_instructions.md"
+        T.BASE_OVERRIDES.clear()
+        self.job = {"job_id": "abcdef123", "title": "ML Intern", "company": "Foo",
+                    "description": "Python AWS"}
+        self.prompts = []
+        p1 = patch.object(T, "compile_tex", side_effect=self.fake_compile)
+        p2 = patch.object(T.time, "sleep", lambda *_: None)
+        p1.start(); p2.start()
+        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
+
+    def tearDown(self):
+        T.RESUMEBOT, T.APPS, T.RESUMES, T.INSTRUCTIONS, ov = self._saved
+        T.BASE_OVERRIDES.clear(); T.BASE_OVERRIDES.update(ov)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    pages = 1
+
+    def fake_compile(self, tex):
+        pdf = Path(tex).with_suffix(".pdf")
+        pdf.write_bytes(b"%PDF")
+        return pdf, self.pages
+
+
+class TestTailor(TailorBase):
+    def writer(self, prompt, cwd, **kw):
+        self.prompts.append(prompt)
+        (Path(cwd) / f"{T.expected_basename(self.job)}.tex").write_text(make_tex("tailored\n"))
+        return ok_run()
+
+    def test_keywords_none_prompt_is_todays(self):
+        with patch.object(T.claude_runner, "run_claude_p", side_effect=self.writer):
+            r = T.tailor_with_claude(self.job)
+        self.assertTrue(r["ok"])
+        p = self.prompts[0]
+        self.assertTrue(p.startswith(TODAY_PROMPT_HEAD))
+        self.assertTrue(p.endswith(TODAY_PROMPT_TAIL))
+        self.assertNotIn("KEYWORDS", p)
+        self.assertNotIn("XYZ", p)
+        self.assertEqual(p, T._GEN_PROMPT.format(tex_name=T.expected_basename(self.job) + ".tex"))
+
+    def test_keywords_prompt_block(self):
+        kw = {"must_have": ["Python", "AWS", "Kubernetes"], "nice_to_have": ["Go"],
+              "covered": ["Python", "AWS"]}
+        with patch.object(T.claude_runner, "run_claude_p", side_effect=self.writer):
+            T.tailor_with_claude(self.job, keywords=kw)
+        p = self.prompts[0]
+        self.assertIn("KEYWORDS (pre-extracted — use these, do NOT run your own extraction):", p)
+        self.assertIn("Must-have: Python, AWS, Kubernetes", p)
+        self.assertIn("Nice-to-have: Go", p)
+        self.assertIn("Already in base: Python, AWS", p)
+        self.assertIn("Missing from base: Kubernetes, Go", p)
+        self.assertIn("NEVER invent a number", p)
+        self.assertIn("TOP 2 bullets", p)
+
+    def test_stage_uses_repaired_base(self):
+        fixed = self.tmp / "fixed.tex"
+        fixed.write_text("REPAIRED")
+        T.BASE_OVERRIDES[T.BASE_VARIANTS[0]] = str(fixed)
+        d = T.stage(self.job)
+        self.assertEqual((d / T.BASE_VARIANTS[0]).read_text(), "REPAIRED")
+        self.assertNotEqual((d / T.BASE_VARIANTS[1]).read_text(), "REPAIRED")
+        self.assertEqual((self.tpl / T.BASE_VARIANTS[0]).read_text(), make_tex())  # template untouched
+
+
+class TestXyzStats(unittest.TestCase):
+    def test_counts(self):
+        tex = (PRE + "\\begin{document}\n\\begin{itemize}\n\\item Cut latency 40\\% by caching\n"
+               "\\item Built API with Flask\n\\item Saved \\$2K\n\\item 3x faster\n"
+               "\\end{itemize}\n\\end{document}")
+        self.assertEqual(T.xyz_bullet_stats(tex), (3, 4))
+        tex2 = (PRE + "\\begin{document}\n\\begin{itemize}\n\\item Built API % 2024 note\n"
+                "\\vspace{-1mm}\n\\item Cut cost 30\\%\n\\end{itemize}\n\\end{document}")
+        self.assertEqual(T.xyz_bullet_stats(tex2), (1, 2))
+
+
+class TestRetailor(TailorBase):
+    def setUp(self):
+        super().setUp()
+        self.d = T.workdir_for(self.job)
+        (self.d / "job_description.txt").write_text("JD")
+        self.v1 = self.d / "Resume_MLIntern_Foo.tex"
+        self.v1.write_text(make_tex())
+
+    def editor(self, change):
+        def run(prompt, cwd, **kw):
+            self.prompts.append(prompt)
+            p = Path(cwd) / "Resume_MLIntern_Foo.tex"
+            p.write_text(change(p.read_text()))
+            return ok_run()
+        return run
+
+    def test_copies_vN_to_vN1_with_only_picked_items(self):
+        ed = self.editor(lambda t: t.replace("Text for Skills", "Kubernetes"))
+        with patch.object(T.claude_runner, "run_claude_p", side_effect=ed):
+            r = T.retailor(self.job, self.v1, ["Kubernetes"], ["Quantify impact"])
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["version"], 2)
+        self.assertEqual(Path(r["tex"]).parent.name, "v2")
+        self.assertEqual(self.v1.read_text(), make_tex())          # v1 kept unchanged
+        p = self.prompts[0]
+        self.assertIn("Keywords to integrate", p)
+        self.assertIn("Kubernetes", p)
+        self.assertIn("Quantify impact", p)
+        self.assertNotIn("Terraform", p)
+        # v2 → v3 lands next to v2, not nested
+        with patch.object(T.claude_runner, "run_claude_p",
+                          side_effect=self.editor(lambda t: t.replace("Kubernetes", "Kubernetes, Go"))):
+            r3 = T.retailor(self.job, r["tex"], ["Go"], [])
+        self.assertEqual(Path(r3["tex"]).parent, self.d / "v3")
+
+    def test_preamble_edit_rejected(self):
+        ed = self.editor(lambda t: t.replace("margin=0.5in", "margin=0.2in"))
+        with patch.object(T.claude_runner, "run_claude_p", side_effect=ed) as cl:
+            r = T.retailor(self.job, self.v1, ["Kubernetes"], [])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["fail_code"], "edit_rejected")
+        self.assertEqual(cl.call_count, T.max_total_attempts() - T.ESCALATION_ATTEMPTS)
+        self.assertEqual(self.v1.read_text(), make_tex())
+
+    def test_nothing_picked(self):
+        with patch.object(T.claude_runner, "run_claude_p") as cl:
+            r = T.retailor(self.job, self.v1, [], [])
+        self.assertEqual(r["fail_code"], "nothing_picked")
+        cl.assert_not_called()
+
+
+class TestSystemInstructions(unittest.TestCase):
+    def test_sections(self):
+        s = (ROOT / "resume_templates" / "system_instructions.md").read_text()
+        for h in ("### 4C — XYZ Bullets", "### 4D — Work Experience", "### 4E — Projects",
+                  "### 4F — Education"):
+            self.assertIn(h, s)
+        self.assertIn("MUST integrate every keyword", s)          # D12 kept as-is
+        self.assertIn("use it as the extracted list and skip extraction", s)
+
+
 if __name__ == "__main__":
     unittest.main()

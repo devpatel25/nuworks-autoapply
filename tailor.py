@@ -43,11 +43,18 @@ def workdir_for(job: dict) -> Path:
     return d
 
 
+# variant name → ATS-repaired copy (data/ats_audit_cache/<sha>.tex) for bases whose
+# audit came back yellow. Set once by the pipeline after audit_bases_cached(), before
+# any worker starts; read-only afterwards. The template files themselves are never
+# written to.
+BASE_OVERRIDES: dict = {}
+
+
 def stage(job: dict) -> Path:
     """Create the per-job working dir with base resumes + the job description."""
     d = workdir_for(job)
     for tex in BASE_VARIANTS:
-        shutil.copy(RESUMEBOT / tex, d / tex)
+        shutil.copy(BASE_OVERRIDES.get(tex) or RESUMEBOT / tex, d / tex)
     (d / "job_description.txt").write_text(
         f"Job Title: {job.get('title','')}\nCompany: {job.get('company','')}\n"
         f"Location: {job.get('location','')}\nType: {job.get('type','')}\n\n"
@@ -120,66 +127,100 @@ def max_total_attempts(retries: int = claude_runner.DEFAULT_RETRIES) -> int:
     return (max(retries, 1) + 2) + ESCALATION_ATTEMPTS
 
 
-def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
-                       retries: int = claude_runner.DEFAULT_RETRIES) -> dict:
-    """Unattended path: `claude -p` writes the tailored .tex (content only — no
-    shell access here), then Python compiles it deterministically and ENFORCES a
-    strict one-page result.
+_GEN_PROMPT = (
+    "Read job_description.txt in this directory. Following your resume "
+    "optimization process, select the best base variant (Resume_SWE_General.tex "
+    "or Resume_AI-ML_General.tex, both here) and tailor it for this job, "
+    "integrating the job's keywords WITHOUT fabricating experience. "
+    "CRITICAL — PRESERVE DENSITY: the chosen base variant is ALREADY a complete, "
+    "well-balanced ONE-page resume. Your job is to EDIT its text in place to weave "
+    "in keywords, NOT to shorten it. Keep its full structure: every Skills category "
+    "line, every work-experience bullet (typically 3/2/3 across the three jobs), the "
+    "full coursework line, and BOTH bullet points under EACH project. Do NOT delete "
+    "skill lines, bullets, or projects, and do NOT leave a half-empty page of white "
+    "space — the finished resume must look as full as the base variant. Rewrite "
+    "bullets to roughly the same length they already are. "
+    "Write the final result to a file named exactly {tex_name} in this directory. "
+    "IMPORTANT: You have NO shell access here — do NOT run pdflatex or any shell "
+    "command. Only write the .tex file; compilation and one-page verification are "
+    "handled automatically after you finish."
+)
 
-    After each compile the page count is checked. If the PDF is >1 page, claude is
-    asked to trim CONTENT (never formatting) and the .tex is recompiled — looping
-    until it fits on a single page or the attempt budget is exhausted. A resume is
-    only ever consolidated / returned as ok once `pages == 1`. (Previously the page
-    count was measured but ignored, so 2-page resumes shipped — that was the bug.)
+XYZ_BULLET_GUIDANCE = (
+    "XYZ BULLETS: rewrite only the TOP {n} bullets of each work-experience entry and "
+    "each project as 'Accomplished [X], as measured by [Y], by doing [Z]'. Use ONLY "
+    "metrics that already exist in the base resume; if a bullet has no real metric, "
+    "write it as 'Did X by doing Z' — NEVER invent a number. Leave all other bullets "
+    "in their current style. The ~29-word cap and every density rule still apply."
+)
 
-    Each attempt has a hard wall-clock kill (see claude_runner); on total failure a
-    classified probable cause is returned. Returns {ok, pdf, tex, pages, workdir,
-    attempts} and, on failure, {fail_code, fail_reason, log}."""
-    d = stage(job)
-    base = expected_basename(job)
-    tex_name = f"{base}.tex"
-    log_path = d / "claude_tailor.log"
+RETAILOR_PROMPT = (
+    "Edit {tex_name} in this directory IN PLACE. It is an already-tailored, finished "
+    "ONE-page resume for the job in job_description.txt. Apply ONLY the changes the "
+    "candidate picked below — nothing else.\n"
+    "Keywords to integrate (each MUST appear naturally, placed only where the "
+    "candidate's real experience supports it — never fabricate experience): {keywords}\n"
+    "Corrections to apply: {corrections}\n"
+    "Change NOTHING else: keep every other bullet, skill line, project and section, "
+    "the same density, the XYZ-format bullets, and every existing metric. Never invent "
+    "a number. Do NOT change anything before \\begin{{document}} (preamble, geometry, "
+    "fonts) or any \\vspace. You have NO shell access — do NOT run pdflatex or any "
+    "shell command; just edit the .tex file. Compilation and one-page verification "
+    "run automatically after you finish."
+)
 
-    gen_prompt = (
-        "Read job_description.txt in this directory. Following your resume "
-        "optimization process, select the best base variant (Resume_SWE_General.tex "
-        "or Resume_AI-ML_General.tex, both here) and tailor it for this job, "
-        "integrating the job's keywords WITHOUT fabricating experience. "
-        "CRITICAL — PRESERVE DENSITY: the chosen base variant is ALREADY a complete, "
-        "well-balanced ONE-page resume. Your job is to EDIT its text in place to weave "
-        "in keywords, NOT to shorten it. Keep its full structure: every Skills category "
-        "line, every work-experience bullet (typically 3/2/3 across the three jobs), the "
-        "full coursework line, and BOTH bullet points under EACH project. Do NOT delete "
-        "skill lines, bullets, or projects, and do NOT leave a half-empty page of white "
-        "space — the finished resume must look as full as the base variant. Rewrite "
-        "bullets to roughly the same length they already are. "
-        f"Write the final result to a file named exactly {tex_name} in this directory. "
-        "IMPORTANT: You have NO shell access here — do NOT run pdflatex or any shell "
-        "command. Only write the .tex file; compilation and one-page verification are "
-        "handled automatically after you finish."
+
+def gen_prompt(tex_name: str, keywords: dict | None = None) -> str:
+    """Generation prompt. keywords=None → exactly today's prompt (backward compatible).
+    With keywords, the pre-extracted list is supplied so the tailor skips its own
+    extraction (D6), plus the XYZ guidance (D11)."""
+    p = _GEN_PROMPT.format(tex_name=tex_name)
+    if not keywords:
+        return p
+    must = keywords.get("must_have", [])
+    nice = keywords.get("nice_to_have", [])
+    covered = set(keywords.get("covered", []))
+    j = lambda xs: ", ".join(xs) or "—"
+    try:
+        import resume_agents
+        n = int(resume_agents.agent_cfg("xyz_bullets_per_role"))
+    except Exception:
+        n = 2
+    return (p + "\n\nKEYWORDS (pre-extracted — use these, do NOT run your own extraction):\n"
+            f"Must-have: {j(must)}\nNice-to-have: {j(nice)}\n"
+            f"Already in base: {j([k for k in must + nice if k in covered])}\n"
+            f"Missing from base: {j([k for k in must + nice if k not in covered])}\n\n"
+            + XYZ_BULLET_GUIDANCE.format(n=n))
+
+
+def _trim_prompt(tex_name: str, pages: int) -> str:
+    return (
+        f"The resume {tex_name} currently compiles to {pages} pages, but it MUST be "
+        f"EXACTLY ONE page — and only slightly over. Edit {tex_name} to recover the "
+        "overflow by TIGHTENING wording, not by gutting content: shorten the longest "
+        "bullets (cut filler words, merge redundant phrasing) so each is under ~29 "
+        "words, and trim the Summary if it runs 3+ lines. Do this FIRST and only as "
+        "much as needed. Do NOT delete whole skill-category lines, do NOT drop a "
+        "project or a project's bullet, and do NOT remove a work-experience entry "
+        "unless tightening every bullet still leaves it over one page. The result "
+        "must stay as full and dense as a normal one-page resume — never leave large "
+        "white space. Keep all true metrics and the keyword-rich content. Do NOT "
+        "change margins, geometry, font size, \\vspace values, or any preamble. You "
+        "have NO shell access; just edit the .tex file. Compilation and page "
+        "verification run automatically after you finish."
     )
 
-    def trim_prompt(pages: int) -> str:
-        return (
-            f"The resume {tex_name} currently compiles to {pages} pages, but it MUST be "
-            f"EXACTLY ONE page — and only slightly over. Edit {tex_name} to recover the "
-            "overflow by TIGHTENING wording, not by gutting content: shorten the longest "
-            "bullets (cut filler words, merge redundant phrasing) so each is under ~29 "
-            "words, and trim the Summary if it runs 3+ lines. Do this FIRST and only as "
-            "much as needed. Do NOT delete whole skill-category lines, do NOT drop a "
-            "project or a project's bullet, and do NOT remove a work-experience entry "
-            "unless tightening every bullet still leaves it over one page. The result "
-            "must stay as full and dense as a normal one-page resume — never leave large "
-            "white space. Keep all true metrics and the keyword-rich content. Do NOT "
-            "change margins, geometry, font size, \\vspace values, or any preamble. You "
-            "have NO shell access; just edit the .tex file. Compilation and page "
-            "verification run automatically after you finish."
-        )
 
-    # Two phases: tailor with Sonnet; if it can't reach exactly one page, ESCALATE
-    # to Opus, which keeps trimming Sonnet's best draft (a more capable model often
-    # resolves the last bit of overflow). `last_pages` carries across phases so the
-    # escalation continues trimming rather than starting over.
+def _run_phases(d: Path, tex_name: str, first_prompt: str, log_path: Path,
+                timeout: int, retries: int, reset, find_tex) -> dict:
+    """Shared compile → one-page trim → Opus escalation loop (tailor + retailor).
+
+    reset()    — called before a fresh (non-trim) attempt in the Sonnet phase.
+    find_tex() — returns the produced .tex Path (named tex_name) or None.
+
+    Two phases: Sonnet; if it can't reach exactly one page, ESCALATE to Opus, which
+    keeps trimming Sonnet's best draft. `last_pages` carries across phases so the
+    escalation continues trimming rather than starting over."""
     phases = [(TAILOR_MODEL, max(retries, 1) + 2),
               (ESCALATION_MODEL, ESCALATION_ATTEMPTS)]
     total = sum(n for _, n in phases)
@@ -188,6 +229,7 @@ def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
     last_pages = 0
     attempt_no = 0
     escalated = False
+    compile_failed = False
     instructions = INSTRUCTIONS.read_text()
 
     for phase_idx, (model, n_attempts) in enumerate(phases):
@@ -203,11 +245,11 @@ def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
         for _ in range(n_attempts):
             attempt_no += 1
             trimming = last_pages > 1
-            # Fresh generation (clearing prior artifacts) only happens in the first
-            # phase. The escalation phase always continues from the existing draft.
+            # Fresh generation (reset) only happens in the first phase. The
+            # escalation phase always continues from the existing draft.
             if not trimming and phase_idx == 0:
-                _clear_tailored_artifacts(d, base)
-            prompt = trim_prompt(last_pages) if trimming else gen_prompt
+                reset()
+            prompt = _trim_prompt(tex_name, last_pages) if trimming else first_prompt
 
             run = claude_runner.run_claude_p(
                 prompt, d, append_system_prompt=instructions,
@@ -215,24 +257,22 @@ def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
             runs.append(run)
             claude_runner._append_attempt_log(log_path, attempt_no, total, run)
 
-            tex = _find_tailored_tex(d, base)
+            tex = find_tex()
             if not tex:
                 last_pages = 0  # no output (stall/timeout) — regenerate fresh next pass
                 if attempt_no < total:
                     time.sleep(claude_runner.DEFAULT_BACKOFF * min(attempt_no, 4))
                 continue
-            if tex.name != tex_name:
-                tex = tex.rename(d / tex_name)
 
             pdf, pages = compile_tex(tex)
             if not pdf:
+                compile_failed = True
                 last_pages = 0  # LaTeX error — regenerate from scratch next pass
                 if attempt_no < total:
                     time.sleep(claude_runner.DEFAULT_BACKOFF * min(attempt_no, 4))
                 continue
 
             if pages == 1:
-                consolidate(pdf, tex)
                 return {"ok": True, "pdf": str(pdf), "tex": str(tex), "pages": 1,
                         "workdir": str(d), "attempts": attempt_no,
                         "model": model, "escalated": escalated}
@@ -251,13 +291,127 @@ def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
                                 ".tex in the workdir needs manual trimming."),
                 "log": str(log_path)}
     code, reason = claude_runner.classify_failure(runs)
-    if _find_tailored_tex(d, base):
+    if compile_failed:
         code, reason = ("compile_failed",
                         "claude produced a resume .tex but it failed to compile to a PDF "
                         "(a LaTeX error). Check the .tex in the workdir.")
     return {"ok": False, "pdf": None, "tex": None, "pages": 0, "workdir": str(d),
             "attempts": attempt_no, "fail_code": code, "fail_reason": reason,
             "log": str(log_path)}
+
+
+def tailor_with_claude(job: dict, timeout: int = claude_runner.DEFAULT_TIMEOUT,
+                       retries: int = claude_runner.DEFAULT_RETRIES,
+                       keywords: dict | None = None) -> dict:
+    """Unattended path: `claude -p` writes the tailored .tex (content only — no
+    shell access here), then Python compiles it deterministically and ENFORCES a
+    strict one-page result.
+
+    After each compile the page count is checked. If the PDF is >1 page, claude is
+    asked to trim CONTENT (never formatting) and the .tex is recompiled — looping
+    until it fits on a single page or the attempt budget is exhausted. A resume is
+    only ever consolidated / returned as ok once `pages == 1`.
+
+    keywords (optional, {must_have, nice_to_have, covered}) — Haiku's verified list;
+    when given the tailor uses it instead of extracting its own. None = old behavior.
+
+    Each attempt has a hard wall-clock kill (see claude_runner); on total failure a
+    classified probable cause is returned. Returns {ok, pdf, tex, pages, workdir,
+    attempts} and, on failure, {fail_code, fail_reason, log}."""
+    d = stage(job)
+    base = expected_basename(job)
+    tex_name = f"{base}.tex"
+
+    def find_tex():
+        tex = _find_tailored_tex(d, base)
+        if tex and tex.name != tex_name:
+            tex = tex.rename(d / tex_name)
+        return tex
+
+    res = _run_phases(d, tex_name, gen_prompt(tex_name, keywords), d / "claude_tailor.log",
+                      timeout, retries, reset=lambda: _clear_tailored_artifacts(d, base),
+                      find_tex=find_tex)
+    if res["ok"]:
+        consolidate(Path(res["pdf"]), Path(res["tex"]))
+        res["version"] = 1
+    return res
+
+
+def version_of(tex) -> int:
+    """v1 lives in the job workdir; retailored versions in <workdir>/vN/."""
+    m = re.fullmatch(r"v(\d+)", Path(tex).parent.name)
+    return int(m.group(1)) if m else 1
+
+
+def retailor(job: dict, tex, picked_keywords: list, picked_corrections: list,
+             timeout: int = claude_runner.DEFAULT_TIMEOUT,
+             retries: int = claude_runner.DEFAULT_RETRIES) -> dict:
+    """Plan §4A.6. Copy the current version's .tex (vN) to <workdir>/v{N+1}/ (vN is
+    kept), have Sonnet edit the copy IN PLACE with ONLY the picked keywords and
+    corrections, then the same compile → 1-page trim → Opus escalation loop.
+
+    Python guards: an edit that leaves the file unchanged or touches anything before
+    \\begin{document} / any \\vspace is rejected (the copy is restored). Returns the
+    tailor result shape plus {version}; on failure {fail_code, fail_reason}."""
+    import resume_agents  # lazy: resume_agents imports tailor
+    tex = Path(tex)
+    src = tex.read_text()
+    n = version_of(tex)
+    root = tex.parent if n == 1 else tex.parent.parent
+    d = root / f"v{n + 1}"
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True)
+    work = d / tex.name
+    jd = root / "job_description.txt"
+    if jd.exists():
+        shutil.copy(jd, d / "job_description.txt")
+    if not (picked_keywords or picked_corrections):
+        return {"ok": False, "fail_code": "nothing_picked", "version": n + 1,
+                "fail_reason": "No keywords or corrections were selected."}
+
+    def reset():
+        work.write_text(src)
+        work.with_suffix(".pdf").unlink(missing_ok=True)
+
+    rejected = []
+
+    def find_tex():
+        new = work.read_text() if work.exists() else src
+        if new == src:
+            return None
+        if not resume_agents.preamble_unchanged(src, new):
+            rejected.append(1)
+            reset()  # forbidden preamble / \vspace edit
+            return None
+        return work
+
+    prompt = RETAILOR_PROMPT.format(
+        tex_name=tex.name,
+        keywords=", ".join(picked_keywords) or "(none)",
+        corrections="; ".join(picked_corrections) or "(none)")
+    res = _run_phases(d, tex.name, prompt, d / "claude_retailor.log",
+                      timeout, retries, reset=reset, find_tex=find_tex)
+    if not res["ok"] and rejected and res["fail_code"] not in ("page_overflow", "compile_failed"):
+        res["fail_code"] = "edit_rejected"
+        res["fail_reason"] = (f"Every retailor edit ({len(rejected)}) changed the preamble or a "
+                              "\\vspace and was rejected; the previous version is unchanged.")
+    res["version"] = n + 1
+    return res
+
+
+METRIC_RE = re.compile(r"\d|%|\\\$|\$|×|\\times|\bfold\b", re.I)
+
+
+def xyz_bullet_stats(tex) -> tuple:
+    """Advisory: (bullets containing a metric, total bullets) in a .tex (path or text)."""
+    text = Path(tex).read_text() if isinstance(tex, Path) or (
+        isinstance(tex, str) and tex.endswith(".tex") and Path(tex).exists()) else tex
+    body = text.split(r"\begin{document}", 1)[-1]
+    items = [i for i in re.split(r"\\item\b", body)[1:]]
+    items = [re.split(r"\\end\{itemize\}", i)[0] for i in items]
+    # drop LaTeX comments and spacing commands so "\vspace{-1mm}" / "% 2024" don't count
+    items = [re.sub(r"\\[vh]space\*?\{[^}]*\}", " ", re.sub(r"(?<!\\)%.*", " ", i)) for i in items]
+    return (sum(1 for i in items if METRIC_RE.search(i)), len(items))
 
 
 def consolidate(pdf: Path, tex: Path | None = None) -> str:
