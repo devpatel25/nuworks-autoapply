@@ -4,5 +4,27 @@
   },
   "supervisor": {
     "max_diagnoses_per_run": 8
+  },
+  "agents": {
+    "keyword_model": "claude-haiku-5-5",
+    "keyword_attempts": 2,
+    "min_match_score": 0.4,
+    "min_keywords": 5,
+    "low_match_timeout_s": 600,
+    "posting_timeout_s": 3600,
+    "ats_fix_attempts": 3,
+    "ats_reaudit_days": 30,
+    "xyz_bullets_per_role": 2,
+    "bi_mcp_dir": "~/Desktop/Claude-env/Biginterview-MCP/Biginterview-MCP",
+    "bi_scoring_guide": "Graduate - STEM Focus",
+    "bi_poll_s": 20,
+    "bi_scan_timeout_s": 600,
+    "bi_reset_delete_count": 5,
+    "retailor_max_rounds": 3,
+    "bi_correction_categories": [
+      "credibility",
+      "ats_fit"
+    ],
+    "bi_max_toggles": 20
   }
 }
