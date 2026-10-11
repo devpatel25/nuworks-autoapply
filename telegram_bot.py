@@ -18,6 +18,8 @@ import re
 import json
 import time
 import html
+import queue
+import threading
 from pathlib import Path
 
 import requests
@@ -90,34 +92,68 @@ def _fmt_pay(salary: str) -> str:
     return s
 
 
+def _ext_links(job: dict) -> list:
+    return [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
+
+
+CAPTION_MAX = 1024  # Telegram sendDocument caption limit
+
+
 def send_resume_for_approval(pdf_path: str, job: dict, summary: str = "",
-                             nonce: str = "") -> int:
-    """Send the tailored resume PDF with Approve/Reject buttons.
+                             nonce: str = "", scan: dict | None = None,
+                             version: int = 1, round_no: int = 0, max_rounds: int = 3,
+                             prev_scan: str = "") -> int:
+    """Send the tailored resume PDF with Approve/Reject (+ optional Scan) buttons.
     Returns the sent message_id. callback_data encodes decision:job_id:nonce — the
-    optional nonce lets wait_for_decision reject a stale tap from an earlier send
-    so it can't auto-approve a freshly tailored resume the user never reviewed."""
+    nonce lets wait_for_decision reject a stale tap from an earlier send so it can't
+    auto-approve a freshly tailored resume the user never reviewed.
+
+    scan=None → no scan UI (legacy). scan={"available": bool, "left": int|None}:
+    available=False (Big Interview login invalid) hides the button and says why."""
     _require()
     jid = job["job_id"]
+    head = "📄 <b>Tailored resume ready</b>"
+    if version > 1:
+        head += f"  (v{version} · retailor {round_no}/{max_rounds})"
     caption = (
-        f"📄 <b>Tailored resume ready</b>\n\n"
+        f"{head}\n\n"
         f"<b>{html.escape(job.get('title','')[:80])}</b>\n"
-        f"{html.escape(job.get('company',''))} — {html.escape(job.get('location',''))}\n"
-        f"💵 Pay: {html.escape(_fmt_pay(job.get('salary','')))}\n"
-        f"🗓 Deadline: {html.escape(str(job.get('deadline') or '—'))}\n"
+        f"{html.escape(job.get('company','')[:80])} — {html.escape(job.get('location','')[:60])}\n"
+        f"💵 Pay: {html.escape(_fmt_pay(job.get('salary',''))[:60])}\n"
+        f"🗓 Deadline: {html.escape(str(job.get('deadline') or '—')[:40])}\n"
     )
     # External apply link(s) — so you can apply yourself (e.g. from your phone).
-    ext = [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
-    if ext:
-        caption += "🌐 Apply externally too (do this yourself): " + "  ".join(ext) + "\n"
-    if summary:
-        caption += f"\n{html.escape(summary[:400])}"
-    caption += "\n\nApprove to auto-apply on NUworks, or Reject to skip."
+    ext = _ext_links(job)
+    ext_line = ("🌐 Apply externally too (do this yourself): "
+                + html.escape("  ".join(ext)) + "\n") if ext else ""
+    summary, prev_scan = (summary or "")[:400], (prev_scan or "")[:120]
 
-    keyboard = {"inline_keyboard": [[
+    def tail_for(summ: str) -> str:
+        t = f"\n{html.escape(summ)}" if summ else ""
+        if prev_scan:
+            t += f"\nPrev scan: {html.escape(prev_scan)}"
+        if scan is not None and not scan.get("available"):
+            t += "\nScan unavailable: log in via scripts/login.py"
+        return t + "\n\nApprove to auto-apply on NUworks, or Reject to skip."
+
+    if len(caption + ext_line + tail_for(summary)) <= CAPTION_MAX:
+        caption += ext_line  # links also appear on the posting card; dropped if too long
+    # Shrink the PLAIN summary until the escaped caption fits — never slice HTML.
+    while summary and len(caption + tail_for(summary)) > CAPTION_MAX:
+        summary = summary[:-20]
+    caption += tail_for(summary)
+
+    row = [
         {"text": "✅ Approve & Apply", "callback_data": f"approve:{jid}:{nonce}"},
         {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
-    ]]}
+    ]
+    if scan is not None and scan.get("available"):
+        left = scan.get("left")
+        label = f"🔍 Scan ({left}/5 left)" if left is not None else "🔍 Scan"
+        row.append({"text": label, "callback_data": f"scan:{jid}:{nonce}"})
+    keyboard = {"inline_keyboard": [row]}
 
+    _expect(jid, nonce)
     pdf_bytes = Path(pdf_path).read_bytes()  # read once; retries need a fresh stream each attempt
     pdf_name = Path(pdf_path).name
     res = _post_with_retry(lambda: requests.post(
@@ -131,37 +167,240 @@ def send_resume_for_approval(pdf_path: str, job: dict, summary: str = "",
     return res["result"]["message_id"]
 
 
+PORTAL_BASE = "https://northeastern-csm.symplicity.com"
+
+
+def job_posting_url(job_id: str) -> str:
+    """Deep link that opens the posting's detail pane — the same URL auto_apply.job_url()
+    navigates to (proven against the live portal). ponytail: duplicated, not imported,
+    so telegram_bot doesn't pull in Playwright; a test keeps the two in sync."""
+    return (f"{PORTAL_BASE}/students/app/jobs/search?perPage=20&page=1&sort=!postdate"
+            f"&ocr=f&job_type=5,17&targeted_academic_majors=0160"
+            f"&currentJobId={job_id}")
+
+
+def posting_card_text(job: dict) -> str:
+    """Plan §4 Step 4 card: title, company, pay, posted, apply-by, external, link."""
+    ext = _ext_links(job)
+    ext_txt = ("Yes — " + "  ".join(html.escape(u) for u in ext)) if ext else "No"
+    url = job_posting_url(job["job_id"])
+    return (
+        "🆕 New posting\n\n"
+        f"<b>{html.escape(job.get('title','')[:120])}</b>\n"
+        f"{html.escape(job.get('company',''))}\n"
+        f"💵 Pay: {html.escape(_fmt_pay(job.get('salary','')))}\n"
+        f"📅 Posted: {html.escape(str(job.get('posted') or '—'))}\n"
+        f"🗓 Apply by: {html.escape(str(job.get('deadline') or '—'))}\n"
+        f"🌐 External apply: {ext_txt}\n"
+        f'🔗 <a href="{html.escape(url, quote=True)}">Job posting</a>'
+    )
+
+
 def send_job_for_approval(job: dict, nonce: str = "") -> int:
     """Send the job POSTING ONLY (no resume yet) with Approve/Reject buttons — gates
-    whether a resume gets tailored at all, so a reject here costs zero tailor tokens.
-    Same callback_data scheme as send_resume_for_approval, so wait_for_decision works
-    unchanged for this gate too."""
+    whether any LLM sees the JD at all, so a reject here costs zero tokens. Same
+    callback_data scheme as send_resume_for_approval."""
     _require()
     jid = job["job_id"]
-    caption = (
-        f"🆕 <b>New job match</b>\n\n"
-        f"<b>{html.escape(job.get('title','')[:80])}</b>\n"
-        f"{html.escape(job.get('company',''))} — {html.escape(job.get('location',''))}\n"
-        f"💵 Pay: {html.escape(_fmt_pay(job.get('salary','')))}\n"
-        f"🗓 Deadline: {html.escape(str(job.get('deadline') or '—'))}\n"
-    )
-    ext = [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
-    if ext:
-        caption += "🌐 External: " + "  ".join(ext) + "\n"
-    caption += "\nApprove to tailor a resume + apply, or Reject to skip (no resume generated)."
-
     keyboard = {"inline_keyboard": [[
         {"text": "✅ Approve", "callback_data": f"approve:{jid}:{nonce}"},
         {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
     ]]}
+    return _send_text(posting_card_text(job), keyboard, jid, nonce, "job approval")
+
+
+def send_low_match_card(job: dict, match: dict, nonce: str = "") -> int:
+    """Plan §4 Step 7: second chance to bail before the (expensive) tailor."""
+    _require()
+    jid = job["job_id"]
+    missing = match.get("missing_must") or []
+    miss = ", ".join(missing[:8]) + (", …" if len(missing) > 8 else "")
+    text = (
+        f"⚠️ Low match: {round((match.get('score') or 0) * 100)}% "
+        f"({match.get('must_hit', 0)}/{match.get('must_total', 0)} must-have)\n\n"
+        f"<b>{html.escape(job.get('title','')[:100])}</b> — {html.escape(job.get('company',''))}\n"
+        f"Missing: {html.escape(miss or '—')}\n\n"
+        "Tailor anyway?"
+    )
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Tailor anyway", "callback_data": f"lowok:{jid}:{nonce}"},
+        {"text": "❌ Skip", "callback_data": f"lowno:{jid}:{nonce}"},
+    ]]}
+    return _send_text(text, keyboard, jid, nonce, "low match")
+
+
+def _send_text(text: str, keyboard: dict, jid: str, nonce: str, what: str) -> int:
+    _expect(jid, nonce)
     res = _post_with_retry(lambda: requests.post(
         f"{API}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": caption, "parse_mode": "HTML",
-              "reply_markup": json.dumps(keyboard)},
+        data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+              "disable_web_page_preview": True, "reply_markup": json.dumps(keyboard)},
         timeout=30).json())
     if not res.get("ok"):
-        raise RuntimeError(f"Telegram sendMessage (job approval) failed: {res}")
+        raise RuntimeError(f"Telegram sendMessage ({what}) failed: {res}")
     return res["result"]["message_id"]
+
+
+def answer_callback(cq_id: str, text: str = ""):
+    try:
+        requests.post(f"{API}/answerCallbackQuery",
+                      data={"callback_query_id": cq_id, "text": text}, timeout=20)
+    except requests.RequestException:
+        pass
+
+
+def edit_reply_markup(message_id: int, keyboard: dict):
+    return _post_with_retry(lambda: requests.post(
+        f"{API}/editMessageReplyMarkup",
+        data={"chat_id": CHAT_ID, "message_id": message_id,
+              "reply_markup": json.dumps(keyboard)}, timeout=30).json())
+
+
+# ── Score card (plan §4A.5) ──────────────────────────────────────────────────
+
+TEXT_BUDGET = 3600  # Telegram sendMessage limit is 4096; leave room for footer lines
+MEDAL = {"gold": "🥇 Gold", "silver": "🥈 Silver", "bronze": "🥉 Bronze"}
+CORRECTION_STATUSES = ("needs_work", "warning")
+
+
+def medal_label(m) -> str:
+    return MEDAL.get((m or "").lower(), "— n/a")
+
+
+def score_card_items(fb: dict, categories=("credibility", "ats_fit")) -> list:
+    """Toggleable items: every UNMATCHED ATS keyword, then corrections (criteria with
+    needs_work / warning + action items) from the allowed categories ONLY (D18)."""
+    cats = fb.get("categories") or {}
+    items, seen = [], set()
+
+    def add(kind, text):
+        text = " ".join(str(text or "").split())
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            items.append({"kind": kind, "text": text})
+
+    for k in (cats.get("ats_fit") or {}).get("keywords_unmatched") or []:
+        add("keyword", k)
+    for c in categories:
+        for cr in (cats.get(c) or {}).get("criteria") or []:
+            if cr.get("status") in CORRECTION_STATUSES:
+                add("correction", cr.get("suggestion") or f"{cr.get('name')}: {cr.get('detail')}")
+    for a in fb.get("action_items") or []:
+        if a.get("category") in categories:
+            add("correction", a.get("item"))
+    return items
+
+
+class ScoreCard:
+    """In-memory state of one score card: items, ticked set, message id. Toggle taps
+    are handled by the dispatcher thread directly (message edited in place) without
+    waking the job worker until Retailor / Back."""
+
+    def __init__(self, job: dict, nonce: str, fb: dict, *, version: int = 1,
+                 scans_left=None, round_no: int = 0, max_rounds: int = 3,
+                 max_toggles: int = 20, categories=("credibility", "ats_fit")):
+        self.job, self.jid, self.nonce = job, job["job_id"], nonce
+        self.fb, self.version, self.scans_left = fb, version, scans_left
+        self.round_no, self.max_rounds = round_no, max_rounds
+        self.partial = bool(fb.get("partial"))
+        self.items = [] if self.partial else score_card_items(fb, tuple(categories))
+        self.selectable = self.items[:max_toggles]
+        self.overflow = self.items[max_toggles:]
+        self.selected: set = set()
+        self.message_id = None
+        self._lock = threading.Lock()
+
+    @property
+    def can_retailor(self) -> bool:
+        return not self.partial and bool(self.selectable) and self.round_no < self.max_rounds
+
+    def picked(self) -> tuple:
+        sel = [self.selectable[i] for i in sorted(self.selected)]
+        return ([i["text"] for i in sel if i["kind"] == "keyword"],
+                [i["text"] for i in sel if i["kind"] == "correction"])
+
+    def text(self) -> str:
+        cats = self.fb.get("categories") or {}
+        ats = cats.get("ats_fit") or {}
+        km, ku = ats.get("keywords_matched") or [], ats.get("keywords_unmatched") or []
+        lines = [f"🔍 Big Interview scan — <b>{html.escape(self.job.get('title','')[:60])}</b> "
+                 f"@ {html.escape(self.job.get('company',''))}  (v{self.version})",
+                 f"Overall: {medal_label(self.fb.get('medal'))}", ""]
+        for key, name in (("readability", "Readability"), ("credibility", "Credibility"),
+                          ("ats_fit", "ATS Fit"), ("format", "Format")):
+            lines.append(f"{name:<12} {medal_label((cats.get(key) or {}).get('badge'))}")
+        lines += ["", f"Keywords matched: {len(km)}/{len(km) + len(ku)}"]
+        if self.partial:
+            lines += ["", "Feedback incomplete — retailor unavailable for this scan"]
+        elif self.selectable and self.round_no < self.max_rounds:
+            lines += ["", "Pick what to fix, then Retailor:"]
+        if self.overflow:
+            lines += ["", "(not selectable — too many):"]
+            budget = TEXT_BUDGET - len("\n".join(lines))
+            for k, i in enumerate(self.overflow):
+                line = f"• {html.escape(i['text'][:100])}"
+                if len(line) + 1 > budget - 40:      # keep room for the "and N more" line
+                    lines.append(f"… and {len(self.overflow) - k} more")
+                    break
+                lines.append(line)
+                budget -= len(line) + 1
+        if self.round_no >= self.max_rounds:
+            lines += ["", f"Retailor limit reached ({self.max_rounds}/{self.max_rounds})"]
+        if self.scans_left is not None:
+            lines += [f"Scans left: {self.scans_left}/5"]
+        return "\n".join(lines)
+
+    def keyboard(self) -> dict:
+        rows = []
+        if self.can_retailor:
+            for i, it in enumerate(self.selectable):
+                box = "☑" if i in self.selected else "☐"
+                tag = "" if it["kind"] == "keyword" else "✎ "
+                rows.append([{"text": f"{box} {tag}{it['text'][:48]}",
+                              "callback_data": f"tg:{self.jid}:{self.nonce}:{i}"}])
+        last = []
+        if self.can_retailor:
+            last.append({"text": f"🔁 Retailor ({len(self.selected)} selected)",
+                         "callback_data": f"retailor:{self.jid}:{self.nonce}"})
+        last.append({"text": "⬅️ Back to resume", "callback_data": f"back:{self.jid}:{self.nonce}"})
+        rows.append(last)
+        return {"inline_keyboard": rows}
+
+    def toggle(self, cq: dict, idx: int):
+        with self._lock:
+            if not self.can_retailor or not 0 <= idx < len(self.selectable):
+                answer_callback(cq["id"], "Not selectable.")
+                return
+            self.selected ^= {idx}
+            on = idx in self.selected
+            kb = self.keyboard()
+        answer_callback(cq["id"], "☑ selected" if on else "☐ removed")
+        try:
+            edit_reply_markup(self.message_id, kb)
+        except Exception:
+            pass
+
+    def refuse(self, action: str):
+        """Gate for wait_for_decision: a 0-selected Retailor tap is refused."""
+        if action == "retailor":
+            with self._lock:
+                if not self.can_retailor:
+                    return "Retailor unavailable for this card."
+                if not self.selected:
+                    return "Select at least one item"
+        return None
+
+
+def send_score_card(job: dict, fb: dict, nonce: str, **kw) -> ScoreCard:
+    """Send the §4A.5 score card and register its toggle handler with the dispatcher.
+    Returns the ScoreCard; wait on it with wait_for_decision(jid, nonce, refuse=card.refuse)."""
+    _require()
+    if not DISPATCHER.running:  # toggles + refusals only work through the dispatcher
+        raise RuntimeError("send_score_card needs the CallbackDispatcher running")
+    card = ScoreCard(job, nonce, fb, **kw)
+    DISPATCHER.on_toggle(card.jid, nonce, card.toggle)
+    card.message_id = _send_text(card.text(), card.keyboard(), card.jid, nonce, "score card")
+    return card
 
 
 def _commit_offset(offset):
@@ -191,6 +430,7 @@ def send_cover_letter_for_approval(pdf_path: str, job: dict, nonce: str = "") ->
         {"text": "✅ Approve letter", "callback_data": f"approve:{jid}:{nonce}"},
         {"text": "❌ Reject", "callback_data": f"reject:{jid}:{nonce}"},
     ]]}
+    _expect(jid, nonce)
     pdf_bytes = Path(pdf_path).read_bytes()  # read once; retries need a fresh stream each attempt
     pdf_name = Path(pdf_path).name
     res = _post_with_retry(lambda: requests.post(
@@ -204,12 +444,151 @@ def send_cover_letter_for_approval(pdf_path: str, job: dict, nonce: str = "") ->
     return res["result"]["message_id"]
 
 
-def wait_for_decision(job_id: str, nonce: str = "", timeout: int = 86400, poll: int = 3) -> str:
-    """Poll getUpdates until the user taps Approve/Reject for this job_id (and, if a
-    nonce is given, for THIS send). Returns 'approve', 'reject', or 'timeout'. Acks
-    every tap so spinners clear; a tap for this job with a stale nonce is treated as
-    expired (acked + ignored) so it can't approve a resume the user never reviewed."""
+# ── Callback dispatcher (plan §5) ────────────────────────────────────────────
+
+ACK_TEXT = {"approve": "Approved ✅", "reject": "Rejected ❌", "lowok": "Tailoring… ✍️",
+            "lowno": "Skipped ⏭️", "scan": "Scanning… (takes up to 10 min)",
+            "retailor": "Retailoring… 🔁", "back": "Back to resume ⬅️"}
+EXPIRED = "This card expired — see the latest one."
+
+
+class CallbackDispatcher:
+    """ONE thread owns getUpdates and routes each tap by callback_data
+    action:job_id:nonce[:idx] into a per-(job_id, nonce) queue, so many cards can be
+    live at once and each job worker blocks only on its own card. Score-card toggles
+    (action 'tg') go to a registered handler instead (message edited in place). Taps
+    for an unknown / finished (job_id, nonce) are acked as expired and dropped."""
+
+    def __init__(self):
+        self._queues: dict = {}
+        self._toggles: dict = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self.offset = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def expect(self, job_id: str, nonce: str) -> "queue.Queue":
+        with self._lock:
+            return self._queues.setdefault((str(job_id), nonce), queue.Queue())
+
+    def on_toggle(self, job_id: str, nonce: str, handler):
+        with self._lock:
+            self._toggles[(str(job_id), nonce)] = handler
+
+    def release(self, job_id: str, nonce: str):
+        with self._lock:
+            self._queues.pop((str(job_id), nonce), None)
+            self._toggles.pop((str(job_id), nonce), None)
+
+    def route(self, cq: dict):
+        parts = (cq.get("data") or "").split(":")
+        if len(parts) < 2:
+            return
+        action, jid = parts[0], parts[1]
+        n = parts[2] if len(parts) > 2 else ""
+        key = (jid, n)
+        with self._lock:
+            q, toggle = self._queues.get(key), self._toggles.get(key)
+        if action == "tg":
+            if toggle is None:
+                answer_callback(cq["id"], EXPIRED)
+                return
+            try:
+                toggle(cq, int(parts[3]))
+            except (IndexError, ValueError):
+                answer_callback(cq["id"], "Not selectable.")
+            return
+        if q is None:
+            answer_callback(cq["id"], EXPIRED if action in ACK_TEXT else
+                            "This card is no longer active.")
+            return
+        q.put((action, cq))
+
+    def poll_once(self, poll_timeout: int = 25):
+        params = {"timeout": poll_timeout}
+        if self.offset is not None:
+            params["offset"] = self.offset
+        try:
+            r = requests.get(f"{API}/getUpdates", params=params,
+                             timeout=poll_timeout + 15).json()
+        except (requests.RequestException, ValueError):
+            time.sleep(3)
+            return
+        for upd in r.get("result", []):
+            self.offset = upd["update_id"] + 1
+            cq = upd.get("callback_query")
+            if cq:
+                try:
+                    self.route(cq)
+                except Exception:
+                    pass  # one bad tap must never kill the poller
+
+    def start(self):
+        if self.running:
+            return
+        _require()
+        self._stop.clear()
+
+        def loop():
+            while not self._stop.is_set():
+                self.poll_once()
+
+        self._thread = threading.Thread(target=loop, name="tg-dispatcher", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=45)
+        self._thread = None
+        _commit_offset(self.offset)  # don't replay processed taps next run
+
+
+DISPATCHER = CallbackDispatcher()
+
+
+def _expect(job_id: str, nonce: str):
+    """Register a card's (job_id, nonce) BEFORE it's sent, so a fast tap can't arrive
+    before its waiter and be dropped as expired."""
+    if DISPATCHER.running:
+        DISPATCHER.expect(job_id, nonce)
+
+
+def wait_for_decision(job_id: str, nonce: str = "", timeout: int = 86400, poll: int = 3,
+                      refuse=None) -> str:
+    """Wait until the user taps a button on this job's card (and, if a nonce is given,
+    THIS send). Returns the action ('approve', 'reject', 'lowok', 'scan', …) or
+    'timeout'. Acks every tap so spinners clear; a stale nonce is acked as expired
+    and ignored so it can't approve a resume the user never reviewed.
+
+    With the dispatcher running this reads from its per-card queue; otherwise it
+    polls getUpdates itself (legacy single-card path). refuse(action) -> str|None
+    may veto a tap (acked with that text, wait continues) — e.g. 0-selected Retailor."""
     _require()
+    if DISPATCHER.running:
+        q = DISPATCHER.expect(job_id, nonce)
+        deadline = time.time() + timeout
+        try:
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    return "timeout"
+                try:
+                    action, cq = q.get(timeout=left)
+                except queue.Empty:
+                    return "timeout"
+                why = refuse(action) if refuse else None
+                if why:
+                    answer_callback(cq["id"], why)
+                    continue
+                answer_callback(cq["id"], ACK_TEXT.get(action, "OK"))
+                return action
+        finally:
+            DISPATCHER.release(job_id, nonce)
     deadline = time.time() + timeout
     offset = None
     while time.time() < deadline:

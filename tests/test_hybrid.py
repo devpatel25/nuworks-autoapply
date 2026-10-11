@@ -496,5 +496,256 @@ class TestSystemInstructions(unittest.TestCase):
         self.assertIn("use it as the extracted list and skip extraction", s)
 
 
+# ── Phase 3: Telegram ────────────────────────────────────────────────────────
+import telegram_bot as TB  # noqa: E402
+
+JOB = {"job_id": "a" * 32, "title": "ML Co-op", "company": "Acme",
+       "salary": "500–500 per week", "posted": "2026-10-10", "deadline": "2026-10-20",
+       "apply_urls": "", "location": "Boston"}
+
+
+def cq(data, i=1):
+    return {"id": f"cq{i}", "data": data}
+
+
+class TestPostingCard(unittest.TestCase):
+    def test_all_fields(self):
+        t = TB.posting_card_text(JOB)
+        for frag in ("🆕 New posting", "<b>ML Co-op</b>", "Acme", "💵 Pay: $500 per week",
+                     "📅 Posted: 2026-10-10", "🗓 Apply by: 2026-10-20",
+                     "🌐 External apply: No", "currentJobId=" + "a" * 32):
+            self.assertIn(frag, t)
+        self.assertNotIn("Boston", t)                     # location dropped
+        t2 = TB.posting_card_text({**JOB, "apply_urls": "https://x.io/a; https://y.io/b",
+                                   "salary": "", "posted": ""})
+        self.assertIn("External apply: Yes — https://x.io/a  https://y.io/b", t2)
+        self.assertIn("Pay: Not listed", t2)
+        self.assertIn("Posted: —", t2)
+
+    def test_posting_url_matches_apply(self):
+        try:
+            import auto_apply
+        except ImportError:
+            self.skipTest("playwright not installed")
+        self.assertEqual(TB.job_posting_url("123"), auto_apply.job_url("123"))
+
+    def test_callback_data_fits_64_bytes(self):
+        n = "abcd1234"
+        for a in ("approve", "reject", "lowok", "lowno", "scan", "retailor", "back"):
+            self.assertLessEqual(len(f"{a}:{JOB['job_id']}:{n}".encode()), 64)
+        self.assertLessEqual(len(f"tg:{JOB['job_id']}:{n}:19".encode()), 64)
+
+
+class TestDispatcher(unittest.TestCase):
+    def setUp(self):
+        self.d = TB.CallbackDispatcher()
+        self.acks = []
+        p = patch.object(TB, "answer_callback", lambda i, t="": self.acks.append((i, t)))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_routes_two_jobs_to_right_queue(self):
+        qa, qb = self.d.expect("A", "n1"), self.d.expect("B", "n2")
+        self.d.route(cq("approve:B:n2", 1))
+        self.d.route(cq("reject:A:n1", 2))
+        self.assertEqual(qa.get_nowait()[0], "reject")
+        self.assertEqual(qb.get_nowait()[0], "approve")
+
+    def test_stale_nonce_acked_expired(self):
+        q = self.d.expect("A", "new")
+        self.d.route(cq("approve:A:old", 9))
+        self.assertTrue(q.empty())
+        self.assertEqual(self.acks, [("cq9", TB.EXPIRED)])
+
+    def test_toggle_goes_to_handler(self):
+        got = []
+        self.d.on_toggle("A", "n", lambda c, i: got.append(i))
+        self.d.route(cq("tg:A:n:3"))
+        self.assertEqual(got, [3])
+        self.d.release("A", "n")
+        self.d.route(cq("tg:A:n:3", 5))
+        self.assertEqual(self.acks[-1], ("cq5", TB.EXPIRED))
+
+    def test_wait_for_decision_reads_dispatcher(self):
+        with patch.object(TB, "DISPATCHER", self.d), \
+             patch.object(type(self.d), "running", property(lambda s: True)), \
+             patch.object(TB, "configured", lambda: True), \
+             patch.object(TB, "_require", lambda: None):
+            q = self.d.expect("A", "n")
+            q.put(("approve", cq("approve:A:n", 7)))
+            self.assertEqual(TB.wait_for_decision("A", "n", timeout=1), "approve")
+            self.assertNotIn(("A", "n"), self.d._queues)          # released after decision
+            self.assertEqual(TB.wait_for_decision("B", "n", timeout=0.05), "timeout")
+            # refuse() vetoes a tap and keeps waiting
+            q = self.d.expect("C", "n")
+            q.put(("retailor", cq("retailor:C:n", 1)))
+            q.put(("back", cq("back:C:n", 2)))
+            r = TB.wait_for_decision("C", "n", timeout=1,
+                                     refuse=lambda a: "Select at least one item" if a == "retailor" else None)
+            self.assertEqual(r, "back")
+            self.assertIn(("cq1", "Select at least one item"), self.acks)
+
+
+FB = {"medal": "silver", "partial": False,
+      "categories": {
+          "readability": {"badge": "gold", "criteria": [
+              {"name": "Length", "status": "needs_work", "detail": "too long", "suggestion": "Shorten"}]},
+          "credibility": {"badge": "bronze", "criteria": [
+              {"name": "Impact", "status": "needs_work", "detail": "d", "suggestion": "Quantify impact"},
+              {"name": "Verbs", "status": "perfect", "detail": "", "suggestion": None}]},
+          "ats_fit": {"badge": "silver", "criteria": [
+              {"name": "Title", "status": "warning", "detail": "missing", "suggestion": "Add job title to summary"}],
+              "keywords_matched": ["Python", "AWS"], "keywords_unmatched": ["Kubernetes", "Terraform"]},
+          "format": {"badge": "gold", "criteria": [
+              {"name": "Fonts", "status": "warning", "detail": "x", "suggestion": "Use one font"}]}},
+      "action_items": [{"category": "format", "item": "Fix margins", "priority": "low"},
+                       {"category": "credibility", "item": "Add metrics", "priority": "high"}]}
+
+
+class TestScoreCard(unittest.TestCase):
+    def setUp(self):
+        self.acks, self.edits = [], []
+        for name, fn in (("answer_callback", lambda i, t="": self.acks.append(t)),
+                         ("edit_reply_markup", lambda m, kb: self.edits.append(kb))):
+            p = patch.object(TB, name, fn); p.start(); self.addCleanup(p.stop)
+
+    def test_items_only_from_credibility_and_ats_fit(self):
+        texts = [i["text"] for i in TB.score_card_items(FB)]
+        self.assertEqual(texts, ["Kubernetes", "Terraform", "Quantify impact",
+                                 "Add job title to summary", "Add metrics"])
+        self.assertNotIn("Shorten", texts)
+        self.assertNotIn("Use one font", texts)
+        self.assertNotIn("Fix margins", texts)
+
+    def test_text_badges_and_keywords(self):
+        c = TB.ScoreCard(JOB, "n", FB, version=2, scans_left=2)
+        t = c.text()
+        for frag in ("Overall: 🥈 Silver", "Readability  🥇 Gold", "Credibility  🥉 Bronze",
+                     "ATS Fit      🥈 Silver", "Format       🥇 Gold", "Keywords matched: 2/4",
+                     "Scans left: 2/5", "(v2)"):
+            self.assertIn(frag, t)
+
+    def test_toggle_flips_and_refuse_zero(self):
+        c = TB.ScoreCard(JOB, "n", FB)
+        c.message_id = 1
+        self.assertEqual(c.refuse("retailor"), "Select at least one item")
+        c.toggle(cq("tg"), 0)
+        self.assertEqual(self.edits[-1]["inline_keyboard"][0][0]["text"][0], "☑")
+        self.assertIn("Retailor (1 selected)", json.dumps(self.edits[-1], ensure_ascii=False))
+        self.assertIsNone(c.refuse("retailor"))
+        c.toggle(cq("tg"), 0)
+        self.assertEqual(self.edits[-1]["inline_keyboard"][0][0]["text"][0], "☐")
+        c.toggle(cq("tg"), 2); c.toggle(cq("tg"), 0)
+        self.assertEqual(c.picked(), (["Kubernetes"], ["Quantify impact"]))
+
+    def test_overflow_over_20(self):
+        fb = json.loads(json.dumps(FB))
+        fb["categories"]["ats_fit"]["keywords_unmatched"] = [f"kw{i}" for i in range(25)]
+        c = TB.ScoreCard(JOB, "n", fb, max_toggles=20)
+        toggles = [r for r in c.keyboard()["inline_keyboard"] if r[0]["callback_data"].startswith("tg:")]
+        self.assertEqual(len(toggles), 20)
+        self.assertIn("(not selectable — too many)", c.text())
+        self.assertIn("kw24", c.text())
+
+    def test_overflow_text_bounded(self):
+        fb = json.loads(json.dumps(FB))
+        fb["categories"]["ats_fit"]["keywords_unmatched"] = [f"keyword number {i} " * 6 for i in range(300)]
+        c = TB.ScoreCard(JOB, "n", fb)
+        self.assertLess(len(c.text()), 4096)
+        self.assertIn("more", c.text().splitlines()[-1] + c.text())
+
+    def test_send_requires_dispatcher(self):
+        with patch.object(TB, "_require", lambda: None), \
+             patch.object(type(TB.DISPATCHER), "running", property(lambda s: False)):
+            with self.assertRaises(RuntimeError):
+                TB.send_score_card(JOB, FB, "n")
+
+    def test_partial_no_toggles(self):
+        c = TB.ScoreCard(JOB, "n", {**FB, "partial": True})
+        kb = c.keyboard()["inline_keyboard"]
+        self.assertEqual(len(kb), 1)
+        self.assertEqual([b["callback_data"].split(":")[0] for b in kb[0]], ["back"])
+        self.assertIn("Feedback incomplete — retailor unavailable", c.text())
+
+    def test_round_limit(self):
+        c = TB.ScoreCard(JOB, "n", FB, round_no=3, max_rounds=3)
+        self.assertNotIn("retailor:", json.dumps(c.keyboard()))
+        self.assertIn("Retailor limit reached (3/3)", c.text())
+
+
+class TestResumeCard(unittest.TestCase):
+    def send(self, **kw):
+        sent = {}
+
+        def fake_post(url, data=None, files=None, timeout=None):
+            sent.update(data)
+
+            class R:
+                def json(self_inner):
+                    return {"ok": True, "result": {"message_id": 1}}
+            return R()
+
+        d = Path(tempfile.mkdtemp())
+        pdf = d / "r.pdf"; pdf.write_bytes(b"%PDF")
+        with patch.object(TB, "_require", lambda: None), patch.object(TB.requests, "post", fake_post):
+            TB.send_resume_for_approval(str(pdf), JOB, summary="ATS ✓ · Match 72%", nonce="n", **kw)
+        shutil.rmtree(d)
+        return sent["caption"], json.loads(sent["reply_markup"])
+
+    def test_scan_button_and_verdict(self):
+        cap, kb = self.send(scan={"available": True, "left": 3}, version=2, round_no=1,
+                            prev_scan="🥈 Silver · ATS Fit: needs work")
+        self.assertIn("ATS ✓ · Match 72%", cap)
+        self.assertIn("(v2 · retailor 1/3)", cap)
+        self.assertIn("Prev scan: 🥈 Silver", cap)
+        self.assertEqual(kb["inline_keyboard"][0][2]["text"], "🔍 Scan (3/5 left)")
+
+    def test_scan_hidden_when_logged_out_and_legacy(self):
+        cap, kb = self.send(scan={"available": False, "left": None})
+        self.assertEqual(len(kb["inline_keyboard"][0]), 2)
+        self.assertIn("Scan unavailable: log in via scripts/login.py", cap)
+        cap, kb = self.send()
+        self.assertEqual(len(kb["inline_keyboard"][0]), 2)
+        self.assertNotIn("Scan unavailable", cap)
+        self.assertLessEqual(len(cap), 1024)
+
+    def test_caption_fits_without_slicing_entities(self):
+        long_job = {**JOB, "apply_urls": "; ".join(f"https://ex.com/{i}?a=1&b=2" for i in range(30)),
+                    "company": "A&B " * 30}
+        sent = {}
+
+        def fake_post(url, data=None, files=None, timeout=None):
+            sent.update(data)
+
+            class R:
+                def json(self_inner):
+                    return {"ok": True, "result": {"message_id": 1}}
+            return R()
+
+        d = Path(tempfile.mkdtemp())
+        pdf = d / "r.pdf"; pdf.write_bytes(b"%PDF")
+        with patch.object(TB, "_require", lambda: None), patch.object(TB.requests, "post", fake_post):
+            TB.send_resume_for_approval(str(pdf), long_job, summary="R&D " * 100, nonce="n",
+                                        prev_scan="x&y " * 40, scan={"available": False})
+        shutil.rmtree(d)
+        cap = sent["caption"]
+        self.assertLessEqual(len(cap), 1024)
+        self.assertTrue(cap.endswith("Reject to skip."))
+        import re as _re
+        self.assertFalse(_re.search(r"&(?!amp;|lt;|gt;|quot;|#x27;)", cap))   # no broken entity
+
+
+class TestLowMatchCard(unittest.TestCase):
+    def test_text(self):
+        sent = {}
+        with patch.object(TB, "_require", lambda: None), \
+             patch.object(TB, "_send_text", lambda t, kb, j, n, w: sent.update(t=t, kb=kb) or 1):
+            TB.send_low_match_card(JOB, {"score": 0.32, "must_hit": 3, "must_total": 9,
+                                         "missing_must": ["Kubernetes", "Terraform"]}, nonce="n")
+        self.assertIn("⚠️ Low match: 32% (3/9 must-have)", sent["t"])
+        self.assertIn("Missing: Kubernetes, Terraform", sent["t"])
+        self.assertEqual([b["callback_data"].split(":")[0] for b in sent["kb"]["inline_keyboard"][0]],
+                         ["lowok", "lowno"])
+
+
 if __name__ == "__main__":
     unittest.main()
