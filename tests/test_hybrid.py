@@ -513,6 +513,20 @@ class TestSystemInstructions(unittest.TestCase):
         self.assertIn("MUST integrate every keyword", s)          # D12 kept as-is
         self.assertIn("use it as the extracted list and skip extraction", s)
 
+    def test_no_summary_and_project_bank(self):
+        s = (ROOT / "resume_templates" / "system_instructions.md").read_text()
+        self.assertIn("### 4A — Headline (NO Summary section)", s)
+        self.assertNotIn("Summary is under 50 words", s)
+        self.assertIn("NO Summary section", T.gen_prompt("R.tex"))
+        self.assertNotIn("trim the Summary", T._trim_prompt("R.tex", 2))
+        with tempfile.TemporaryDirectory() as td:
+            ins, bank = Path(td) / "i.md", Path(td) / "b.md"
+            ins.write_text("INSTR")
+            with patch.object(T, "INSTRUCTIONS", ins), patch.object(T, "PROJECT_BANK", bank):
+                self.assertEqual(T.load_instructions(), "INSTR")       # no bank → unchanged
+                bank.write_text("## APPENDIX: Project Bank")
+                self.assertTrue(T.load_instructions().endswith("## APPENDIX: Project Bank"))
+
 
 # ── Phase 3: Telegram ────────────────────────────────────────────────────────
 import telegram_bot as TB  # noqa: E402
