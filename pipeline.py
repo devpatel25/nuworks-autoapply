@@ -47,6 +47,7 @@ import claude_runner
 import stats
 import resume_agents as ra
 import telegram_bot as tg
+import events
 
 # external_autofill loads its OWN copy of telegram_bot by file path (so wellfound can
 # share it). Inside this pipeline it must use the shared module instead — otherwise
@@ -1060,6 +1061,7 @@ def main():
     # deadline is extended phase-by-phase as we go; if it's ever passed the run
     # is aborted WITHOUT marking the day, so it retries live on next login.
     _start_watchdog(SCRAPE_BUDGET)
+    events.instrument(sys.modules[__name__])  # live trace for the pipeline-live pane
 
     if do_scrape and not scrape_with_duo_retry():
         return  # skipped / no response / non-DUO failure — stop here
