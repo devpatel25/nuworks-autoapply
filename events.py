@@ -195,22 +195,35 @@ def _demo():
         sleep(a, b)
         emit(agent, "end", out, job=jid, span=sid, kind=kind, fn=fn, dur=round(time.time() - t0, 1))
 
+    def card(jid, fn, decision, a=1, b=4):
+        emit("telegram", "msg", fn, job=jid, kind="send", fn=fn)
+        stage("telegram", jid, "wait_for_decision", decision, a, b, "wait")
+
     def worker(j):
-        jid = j["job_id"]
+        # each demo job takes a different path so every branch lights up
+        jid, k = j["job_id"], int(j["job_id"][1:])
         _titles[jid] = j["title"]
-        emit("telegram", "msg", "send_job_for_approval", job=jid, kind="send")
-        stage("telegram", jid, "wait_for_decision", "approve", 2, 6, "wait")
+        card(jid, "send_job_for_approval", "approve", 2, 6)
         stage("keywords", jid, "extract_keywords", "12 keys")
+        if k == 1:
+            card(jid, "send_low_match_card", "lowok")
         stage("tailor", jid, "tailor_with_claude", "ok=True", 4, 8)
         stage("verifier", jid, "verify_tailored_pdf", "ok=True", 0.5, 1)
-        emit("telegram", "msg", "send_resume_for_approval", job=jid, kind="send")
-        stage("telegram", jid, "wait_for_decision", "scan", 1, 4, "wait")
-        for cmd in ("auth", "start", "status", "feedback"):
-            stage("bi_scan", jid, cmd, "ok=True", 0.5, 2)
-        stage("telegram", jid, "wait_for_decision", "approve", 1, 3, "wait")
-        stage("cover_letter", jid, "generate_with_claude", "ok=True", 2, 4)
+        if k == 0:
+            card(jid, "send_resume_for_approval", "scan")
+            for cmd in ("auth", "start", "status", "feedback"):
+                stage("bi_scan", jid, cmd, "ok=True", 0.5, 1.5)
+            card(jid, "send_score_card", "retailor")
+            stage("tailor", jid, "retailor", "ok=True", 3, 5)
+            stage("verifier", jid, "verify_tailored_pdf", "ok=True", 0.5, 1)
+        card(jid, "send_resume_for_approval", "approve")
+        if k != 2:
+            stage("cover_letter", jid, "generate_with_claude", "ok=True", 2, 4)
+            card(jid, "send_cover_letter_for_approval", "approve")
         with _lock_apply:
             stage("apply", jid, "apply_to_job", "status=applied", 3, 5)
+            if k == 2:
+                stage("external", jid, "process_job", "None", 2, 3)
 
     _lock_apply = threading.Lock()
     emit("pipeline", "start", f"run {RUN} (demo)")
