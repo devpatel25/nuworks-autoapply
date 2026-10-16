@@ -38,6 +38,13 @@ def load_instructions() -> str:
     s = INSTRUCTIONS.read_text()
     if PROJECT_BANK.exists():
         s += "\n\n---\n\n" + PROJECT_BANK.read_text()
+    # The .md (shared with interactive use) says to compile + recompile; claude -p
+    # has no shell, so it stalled or asked for permissions instead (2026-10-15).
+    s += ("\n\nUNATTENDED MODE: ignore every compile / verify / recompile step above. "
+          "You have no shell access. Only edit the .tex file — Python compiles it and "
+          "checks the page count. Every file you need (both base .tex variants, "
+          "job_description.txt) is in the current directory: use relative paths only and "
+          "never read resume_templates/ or anything outside this directory.")
     return s
 
 
@@ -135,6 +142,10 @@ ESCALATION_ATTEMPTS = 3
 # attempt times out). Pin tailoring to medium.
 TAILOR_EFFORT = "medium"
 
+# First-draft generation legitimately takes ~240-270s (2026-10-15: four attempts
+# killed at 300s). Trim attempts are small edits and keep the shorter timeout.
+GEN_TIMEOUT = 480
+
 
 def max_total_attempts(retries: int = claude_runner.DEFAULT_RETRIES) -> int:
     """Worst-case attempt count across both phases (for the pipeline watchdog)."""
@@ -158,6 +169,9 @@ _GEN_PROMPT = (
     "Do NOT delete skill lines or bullets, and do NOT leave a half-empty page of white "
     "space — the finished resume must look as full as the base variant. Rewrite "
     "bullets to roughly the same length they already are. "
+    "LINE BUDGET: the base fills the page with only ~2 spare lines. Adding keywords "
+    "must not make a skill line or bullet wrap onto an extra line — the tailored resume "
+    "must not have more rendered lines than the base. "
     "Write the final result to a file named exactly {tex_name} in this directory. "
     "IMPORTANT: You have NO shell access here — do NOT run pdflatex or any shell "
     "command. Only write the .tex file; compilation and one-page verification are "
@@ -214,15 +228,35 @@ def gen_prompt(tex_name: str, keywords: dict | None = None) -> str:
             + XYZ_BULLET_GUIDANCE.format(n=n))
 
 
-def _trim_prompt(tex_name: str, pages: int) -> str:
+def page2_spill(pdf: Path) -> tuple[int, str]:
+    """(non-blank line count, text) of what spilled onto page 2 — the trimmer can't
+    compile, so without this it only knows "2 pages" and cuts words that save no lines."""
+    try:
+        txt = subprocess.run(["pdftotext", "-f", "2", "-l", "2", str(pdf), "-"],
+                             capture_output=True, text=True).stdout
+    except Exception:
+        return 0, ""
+    lines = [l for l in txt.splitlines() if l.strip()]
+    return len(lines), "\n".join(lines)
+
+
+def _trim_prompt(tex_name: str, pages: int, spill_lines: int = 0, spill_text: str = "") -> str:
+    spill = ""
+    if spill_lines:
+        spill = (f"Exactly {spill_lines} rendered line(s) spilled onto page 2:\n"
+                 f"<<<\n{spill_text}\n>>>\nYou must free AT LEAST {spill_lines} whole "
+                 "rendered lines (aim for 1 more as margin). Savings count ONLY in whole "
+                 "lines: shortening a bullet that still wraps to 2 lines saves nothing. Target "
+                 "bullets and skill lines that barely wrap and make them fit on one line. ")
     return (
         f"The resume {tex_name} currently compiles to {pages} pages, but it MUST be "
-        f"EXACTLY ONE page — and only slightly over. Edit {tex_name} to recover the "
+        f"EXACTLY ONE page — and only slightly over. {spill}Edit {tex_name} to recover the "
         "overflow IN THIS ORDER, stopping as soon as it fits: (1) shorten the Others "
         "skills line, then the Certifications line (drop the least job-relevant items); "
         "(2) tighten the longest bullets (cut filler, merge redundant phrasing) so each "
         "is under ~29 words; (3) if there are 4 projects, remove the least relevant one; "
-        "(4) shorten the coursework lines. Never go below 3 projects, never drop a "
+        "(4) shorten the coursework lines; (5) last resort: remove the lead project's "
+        "3rd bullet. Never go below 3 projects, never drop a "
         "skill-category line or a work-experience entry or bullet, and never add a "
         "Summary section. The result "
         "must stay as full and dense as a normal one-page resume — never leave large "
@@ -249,6 +283,7 @@ def _run_phases(d: Path, tex_name: str, first_prompt: str, log_path: Path,
 
     runs = []
     last_pages = 0
+    spill = (0, "")
     attempt_no = 0
     escalated = False
     compile_failed = False
@@ -271,11 +306,12 @@ def _run_phases(d: Path, tex_name: str, first_prompt: str, log_path: Path,
             # escalation phase always continues from the existing draft.
             if not trimming and phase_idx == 0:
                 reset()
-            prompt = _trim_prompt(tex_name, last_pages) if trimming else first_prompt
+            prompt = _trim_prompt(tex_name, last_pages, *spill) if trimming else first_prompt
 
             run = claude_runner.run_claude_p(
                 prompt, d, append_system_prompt=instructions,
-                add_dir=str(d), timeout=timeout, model=model,
+                add_dir=str(d), timeout=timeout if trimming else max(timeout, GEN_TIMEOUT),
+                model=model,
                 effort=TAILOR_EFFORT)
             runs.append(run)
             claude_runner._append_attempt_log(log_path, attempt_no, total, run)
@@ -302,6 +338,7 @@ def _run_phases(d: Path, tex_name: str, first_prompt: str, log_path: Path,
 
             # Compiled but >1 page → keep the .tex and trim it on the next pass.
             last_pages = pages
+            spill = page2_spill(pdf)
 
     # Exhausted both phases without a one-page PDF — classify why.
     if last_pages and last_pages > 1:

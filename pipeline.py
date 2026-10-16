@@ -101,12 +101,12 @@ APPROVAL_TIMEOUT = 3600  # 1 hour
 SCRAPE_TIMEOUT  = 900                                                  # hard kill for the scrape subprocess (login + DUO up to 10 min + scrape)
 SCRAPE_BUDGET   = SCRAPE_TIMEOUT + 120                                  # watchdog must OUTLAST the subprocess timeout, so the graceful killpg path wins instead of os._exit (which orphans the browser — the 06-10 10:29 trip)
 # Tailoring runs up to max_total_attempts() (Sonnet phase + Opus escalation phase),
-# each up to DEFAULT_TIMEOUT, with capped linear backoff between regenerations +
+# each up to tailor.GEN_TIMEOUT (any attempt can be a fresh generation), with capped linear backoff between regenerations +
 # pdflatex time. The budget must cover that real worst case or the watchdog hard-
 # kills a healthy-but-slow tailor that's legitimately escalating to Opus (H2).
 _TAILOR_ATTEMPTS = tailor.max_total_attempts()
 _TAILOR_BACKOFF  = claude_runner.DEFAULT_BACKOFF * sum(min(i, 4) for i in range(1, _TAILOR_ATTEMPTS))
-TAILOR_BUDGET   = _TAILOR_ATTEMPTS * claude_runner.DEFAULT_TIMEOUT + _TAILOR_BACKOFF + 300
+TAILOR_BUDGET   = _TAILOR_ATTEMPTS * max(tailor.GEN_TIMEOUT, claude_runner.DEFAULT_TIMEOUT) + _TAILOR_BACKOFF + 300
 APPLY_BUDGET    = 300                                                  # one portal apply
 
 # How many resumes to tailor concurrently up front (the slow claude -p calls).

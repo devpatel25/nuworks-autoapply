@@ -523,9 +523,32 @@ class TestSystemInstructions(unittest.TestCase):
             ins, bank = Path(td) / "i.md", Path(td) / "b.md"
             ins.write_text("INSTR")
             with patch.object(T, "INSTRUCTIONS", ins), patch.object(T, "PROJECT_BANK", bank):
-                self.assertEqual(T.load_instructions(), "INSTR")       # no bank → unchanged
+                self.assertTrue(T.load_instructions().startswith("INSTR"))  # no bank
+                self.assertNotIn("Project Bank", T.load_instructions())
+                self.assertIn("ignore every compile", T.load_instructions())
                 bank.write_text("## APPENDIX: Project Bank")
-                self.assertTrue(T.load_instructions().endswith("## APPENDIX: Project Bank"))
+                self.assertIn("## APPENDIX: Project Bank", T.load_instructions())
+
+    @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("pdftotext"), "needs TeX")
+    def test_page2_spill_feeds_trim_prompt(self):
+        base = ROOT / "resume_templates" / "Resume_AI-ML_General.tex"
+        if not base.exists():
+            self.skipTest("personal template not present")
+        with tempfile.TemporaryDirectory() as td:
+            ok = Path(td) / "ok.tex"; ok.write_text(base.read_text())
+            pdf, pages = T.compile_tex(ok)
+            self.assertEqual((pages, T.page2_spill(pdf)[0]), (1, 0))
+            over = Path(td) / "over.tex"
+            over.write_text(base.read_text().replace(
+                "\\end{document}", "\\vspace*{40mm}SPILLMARK\n\\end{document}"))
+            pdf, pages = T.compile_tex(over)
+            n, text = T.page2_spill(pdf)
+            self.assertEqual(pages, 2)
+            self.assertGreater(n, 0)
+            self.assertIn("SPILLMARK", text)
+            prompt = T._trim_prompt("R.tex", 2, n, text)
+            self.assertIn(f"free AT LEAST {n} whole", prompt)
+            self.assertIn("SPILLMARK", prompt)
 
 
 # ── Phase 3: Telegram ────────────────────────────────────────────────────────
