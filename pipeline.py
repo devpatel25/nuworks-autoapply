@@ -2,17 +2,19 @@
 """
 NUworks daily auto-apply orchestrator.
 
-Flow:
-  1. Scrape today's jobs              (job_scraper.py -> ../jobs.csv)
+Flow (HYBRID_PIPELINE_PLAN.md):
+  1. Scrape today's jobs              (job_scraper.py -> data/jobs.csv)
   2. Classify apply method            (apply_type.py) -> keep in_portal, not applied
-  3. Tailor a resume per job          (tailor.py / ResumeBot2.1)
-  4. Send resume to Telegram          (telegram_bot.py) with Approve/Reject
-  5. Wait for the user's decision
-  6. On Approve -> auto-apply         (auto_apply.py, mode="submit")
-  7. Log + notify results
+  3. Base ATS audit, once per run     (resume_agents.audit_bases_cached)
+  4. Send ALL posting cards at once   (telegram_bot) — no LLM sees a JD before Approve
+  5-11. Per approved job, in parallel: Haiku keywords → verify/score → low-match
+        card → tailor → post-check → verdict → resume card (Scan → score card →
+        Retailor loop)
+  12-14. Cover letter (own approval) → auto-apply (one browser at a time) → external
+  15. Summary, mark/unmark day, stats, supervisor report
 
-The Telegram approval is the human-in-the-loop gate: NOTHING is submitted to an
-employer without an explicit Approve tap.
+The Telegram approvals are the human-in-the-loop gates: NOTHING is tailored without
+a posting Approve and NOTHING is submitted without a resume Approve.
 
 Usage:
   python3 pipeline.py [--no-scrape] [--limit N] [--dry-apply]
@@ -22,7 +24,9 @@ Usage:
 """
 import os
 import sys
+import atexit
 import csv
+import html
 import json
 import time
 import uuid
@@ -33,7 +37,7 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import apply_type
 import auto_apply
@@ -43,12 +47,24 @@ import external_apply
 import external_autofill
 import claude_runner
 import stats
+import resume_agents as ra
 import telegram_bot as tg
+import events
+
+# external_autofill loads its OWN copy of telegram_bot by file path (so wellfound can
+# share it). Inside this pipeline it must use the shared module instead — otherwise
+# its approval wait runs a second getUpdates poller next to tg.DISPATCHER and the two
+# steal each other's taps.
+external_autofill.tg = tg
 
 HERE = Path(__file__).resolve().parent
 JOBS_CSV = HERE / "data" / "jobs.csv"
 LOG_DIR = HERE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# Pause flag toggled by /pause nuworks and /continue nuworks (claude-bridge/
+# bridge.py) — checked at the top of every sibling pipeline against its own name.
+PAUSE_FLAG = HERE.parent / ".autoapply_paused.nuworks"
 
 # Single-instance lock. The LaunchAgent fires at 6 slots/day AND on login; a run
 # that is still waiting on a Telegram approval (up to 1h/job) can easily still be
@@ -87,12 +103,12 @@ APPROVAL_TIMEOUT = 3600  # 1 hour
 SCRAPE_TIMEOUT  = 900                                                  # hard kill for the scrape subprocess (login + DUO up to 10 min + scrape)
 SCRAPE_BUDGET   = SCRAPE_TIMEOUT + 120                                  # watchdog must OUTLAST the subprocess timeout, so the graceful killpg path wins instead of os._exit (which orphans the browser — the 06-10 10:29 trip)
 # Tailoring runs up to max_total_attempts() (Sonnet phase + Opus escalation phase),
-# each up to DEFAULT_TIMEOUT, with capped linear backoff between regenerations +
+# each up to tailor.GEN_TIMEOUT (any attempt can be a fresh generation), with capped linear backoff between regenerations +
 # pdflatex time. The budget must cover that real worst case or the watchdog hard-
 # kills a healthy-but-slow tailor that's legitimately escalating to Opus (H2).
 _TAILOR_ATTEMPTS = tailor.max_total_attempts()
 _TAILOR_BACKOFF  = claude_runner.DEFAULT_BACKOFF * sum(min(i, 4) for i in range(1, _TAILOR_ATTEMPTS))
-TAILOR_BUDGET   = _TAILOR_ATTEMPTS * claude_runner.DEFAULT_TIMEOUT + _TAILOR_BACKOFF + 300
+TAILOR_BUDGET   = _TAILOR_ATTEMPTS * max(tailor.GEN_TIMEOUT, claude_runner.DEFAULT_TIMEOUT) + _TAILOR_BACKOFF + 300
 APPLY_BUDGET    = 300                                                  # one portal apply
 
 # How many resumes to tailor concurrently up front (the slow claude -p calls).
@@ -100,7 +116,31 @@ APPLY_BUDGET    = 300                                                  # one por
 # its own workdir via an independent claude -p, so the wave is thread-safe.
 TAILOR_PARALLELISM = int(os.environ.get("NUWORKS_TAILOR_PARALLELISM", "6"))
 
+# ── Hybrid pipeline (HYBRID_PIPELINE_PLAN.md §4–§5) ─────────────────────────
+POSTING_TIMEOUT   = int(ra.agent_cfg("posting_timeout_s"))     # posting card window
+LOW_MATCH_TIMEOUT = int(ra.agent_cfg("low_match_timeout_s"))   # low-match card window
+KEYWORD_BUDGET    = int(ra.agent_cfg("keyword_attempts")) * 200
+HYBRID_BUDGET     = KEYWORD_BUDGET + TAILOR_BUDGET             # Steps 5–8 worst case
+SCAN_BUDGET       = int(ra.agent_cfg("bi_scan_timeout_s")) + 300   # scan + delete/reset
+RETAILOR_BUDGET   = TAILOR_BUDGET
+ATS_AUDIT_BUDGET  = int(ra.agent_cfg("ats_fix_attempts")) * claude_runner.DEFAULT_TIMEOUT * 2 + 300
+BI_MIN_POLL_S     = 20   # Big Interview: never poll faster than this (invariant 9)
+
+# Up to TAILOR_PARALLELISM jobs run claude -p at once; a job WAITING on a Telegram
+# card holds no slot. Every posting card gets its own (cheap) waiter thread.
+LLM_SLOTS  = threading.BoundedSemaphore(TAILOR_PARALLELISM)
+APPLY_LOCK = threading.Lock()   # one browser session (NUworks / external ATS) at a time
+SCAN_LOCK  = threading.Lock()   # one Big Interview scan in flight, no parallel MCP calls
+_scans_lock = threading.Lock()
+SCANS_FILE = HERE / "data" / "scans.json"
+SCAN_RESET_STAMP = HERE / "data" / "scan_reset_date.txt"  # limit reset: at most once a day
+
 _watchdog_deadline = None  # wall-clock time the run must not pass
+_scrape_pgid = None  # process group of the live scrape() subprocess, if any (so the
+                     # watchdog can kill it too instead of orphaning it — the 06-10 and
+                     # 09-12 incidents: a sleep/wake stall trips the watchdog, but without
+                     # this the scrape subprocess keeps running unattended and its result
+                     # (session.json / jobs.csv) is silently never consumed by anyone)
 
 
 def _start_watchdog(budget: int):
@@ -116,6 +156,11 @@ def _start_watchdog(budget: int):
             if _watchdog_deadline and time.time() > _watchdog_deadline:
                 log("⏱️  WATCHDOG: run exceeded its time budget — a step is hung. "
                     "Aborting (today left UNMARKED → retries on next login).")
+                if _scrape_pgid is not None:
+                    try:
+                        os.killpg(_scrape_pgid, signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
                     if tg.configured():
                         tg.send_message(
@@ -130,12 +175,16 @@ def _start_watchdog(budget: int):
     threading.Thread(target=loop, daemon=True).start()
 
 
+_watchdog_lock = threading.Lock()  # job workers bump concurrently
+
+
 def bump_watchdog(extra: int):
     """Push the watchdog deadline out by `extra` seconds from now (only ever
     later, never earlier)."""
     global _watchdog_deadline
-    if _watchdog_deadline is not None:
-        _watchdog_deadline = max(_watchdog_deadline, time.time() + extra)
+    with _watchdog_lock:
+        if _watchdog_deadline is not None:
+            _watchdog_deadline = max(_watchdog_deadline, time.time() + extra)
 
 # Once-per-day guard: lets the LaunchAgent fire on every login (RunAtLoad) so a
 # missed 10AM run "catches up" the moment the Mac is next turned on, while only
@@ -164,9 +213,59 @@ def mark_ran_today():
     RUN_STAMP.write_text(date.today().isoformat())
 
 
+def _kill_tree():
+    """SIGKILL every descendant of this process. Walks the ps tree instead of
+    killpg because scrape() and claude -p run in their own sessions."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    kids = {}
+    for line in out.splitlines():
+        pid, ppid = map(int, line.split())
+        kids.setdefault(ppid, []).append(pid)
+    todo, tree = [os.getpid()], []
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            tree.append(c)
+            todo.append(c)
+    for pid in tree:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _on_command(cmd: str):
+    """Telegram /start, /stop or /apply <id> sent while this run is live (control_bot.py
+    handles them when no run is). Anything else is ignored — never the kill path."""
+    verb, _, arg = cmd.partition(" ")
+    if verb == "/start":
+        tg.send_message("▶️ NUworks run is already in progress. Send /stop to kill it.")
+        return
+    if verb == "/apply":
+        if not arg:
+            tg.send_message(tg.APPLY_USAGE)
+        elif _submit_manual(arg):
+            tg.send_message("📥 Fetching posting…")
+        else:  # main() is past the join point — hand it to the next (idle) run
+            tg.queue_apply(arg)
+            tg.send_message("📥 This run is wrapping up — queued, a new run will pick it up.")
+        return
+    if verb != "/stop":
+        return
+    log("Telegram /stop — killing run and marking today done.")
+    mark_ran_today()
+    try:  # best-effort: a Telegram outage must never keep the run alive
+        tg._commit_offset(tg.DISPATCHER.offset)  # so the listener doesn't replay /stop
+        tg.send_message("🛑 NUworks run stopped. It won't run again today — send /start to rerun.")
+    except Exception as e:
+        log(f"  /stop ack failed ({type(e).__name__}: {e}) — killing anyway")
+    _kill_tree()
+    os._exit(0)
+
+
 # Jobs the user didn't decide on in time (approval timed out). Re-queued on the
 # next run so a busy afternoon doesn't lose a posting forever. H5.
 PENDING_FILE = HERE / "data" / "pending_retry.json"
+_pending_lock = threading.RLock()  # job workers update the queue concurrently
 
 
 def load_pending() -> list[dict]:
@@ -189,6 +288,11 @@ def add_pending(job: dict, failure_class: str = "transient", detail: str = ""):
     detail and timestamp — the supervisor uses _attempts + _last_class to cap doomed
     loops (a job that keeps failing the same structural way is evicted, not retried).
     Backward-compatible: callers that pass no class re-queue as a plain transient."""
+    with _pending_lock:
+        _add_pending_locked(job, failure_class, detail)
+
+
+def _add_pending_locked(job: dict, failure_class: str, detail: str):
     items = load_pending()
     now = datetime.now().isoformat()
     for p in items:
@@ -201,7 +305,7 @@ def add_pending(job: dict, failure_class: str = "transient", detail: str = ""):
             return
     # First queue: keep the fields a later run needs to tailor + apply without re-scraping.
     keep = {k: job.get(k) for k in ("job_id", "title", "company", "location",
-                                    "salary", "deadline", "description", "apply_urls",
+                                    "salary", "posted", "deadline", "description", "apply_urls",
                                     "_apply_type", "_required_docs")}
     keep["_queued_at"] = now
     keep["_first_queued"] = now
@@ -213,10 +317,11 @@ def add_pending(job: dict, failure_class: str = "transient", detail: str = ""):
 
 
 def clear_pending(job_id: str):
-    items = load_pending()
-    kept = [p for p in items if p.get("job_id") != job_id]
-    if len(kept) != len(items):
-        save_pending(kept)
+    with _pending_lock:
+        items = load_pending()
+        kept = [p for p in items if p.get("job_id") != job_id]
+        if len(kept) != len(items):
+            save_pending(kept)
 
 
 def load_skiplist() -> set:
@@ -232,7 +337,7 @@ def load_skiplist() -> set:
 
 def add_to_skiplist(job_id: str):
     SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(SKIP_FILE, "a") as f:
+    with _pending_lock, open(SKIP_FILE, "a") as f:
         f.write(f"{job_id}\n")
 
 
@@ -269,12 +374,15 @@ def scrape():
     # inherited pipe). On timeout we SIGKILL the whole group so a wedged
     # browser/login can never hang the run (today's 06-06 failure mode). Output
     # to scrape_last.log survives a kill, unlike buffered stdout.
+    global _scrape_pgid
     scrape_log = LOG_DIR / "scrape_last.log"
     with open(scrape_log, "w") as f:
         proc = subprocess.Popen(
             [sys.executable, "-u", str(HERE / "job_scraper.py")],
             cwd=str(HERE), stdout=f, stderr=subprocess.STDOUT,
             start_new_session=True)
+        _scrape_pgid = proc.pid  # start_new_session means pgid == pid; lets the
+                                 # top-level watchdog kill it too if IT trips first
         try:
             rc = proc.wait(timeout=SCRAPE_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -283,6 +391,8 @@ def scrape():
             except Exception:
                 proc.kill()
             raise
+        finally:
+            _scrape_pgid = None
     if rc == 3:
         # DUO push wasn't approved in the scraper's window — a normal, expected
         # outcome that main() handles by asking the user to rerun or skip.
@@ -291,14 +401,15 @@ def scrape():
         raise subprocess.CalledProcessError(rc, "job_scraper.py")
 
 
-def scrape_with_duo_retry() -> bool:
+def scrape_with_duo_retry(mark_skip: bool = True) -> bool:
     """Run the scrape; if the DUO push isn't approved in the scraper's window, ask
     the user (Telegram, two inline buttons) whether to resend the push and try
     again now, or skip for today — and act on the tap. Loops so the user can rerun
     as many times as they like (each rerun is a fresh login + push + scrape).
 
     Returns True if the scrape succeeded (proceed with the run), or False if the
-    run should stop here (skip / no response / a non-DUO failure)."""
+    run should stop here (skip / no response / a non-DUO failure). mark_skip=False
+    (manual /apply) keeps a "skip" from consuming today's scheduled run."""
     while True:
         try:
             scrape()
@@ -323,6 +434,9 @@ def scrape_with_duo_retry() -> bool:
                 bump_watchdog(SCRAPE_BUDGET)
                 continue  # loop back and re-scrape (fresh login + push)
             if choice == "skip":
+                if not mark_skip:
+                    tg.send_message("⏭️ Skipped the DUO retry — that posting wasn't loaded.")
+                    return False
                 mark_ran_today()  # explicit skip → don't fire again today
                 tg.send_message("⏭️ Skipped today's NUworks run as requested. "
                                 "I won't prompt for DUO again until tomorrow.")
@@ -420,86 +534,6 @@ def merge_pending(todo: list[dict]) -> list[dict]:
     return out
 
 
-def _tailor_one(job: dict) -> dict:
-    """Tailor ONE job's resume (reusing a 1-page PDF if already present). Pure worker
-    for the thread pool — returns a result dict; does no logging (the main thread logs
-    as futures complete) and mutates nothing shared (tailor uses a per-job workdir)."""
-    existing = tailor.latest_pdf(job)
-    if existing:
-        return {"pdf": existing, "reused": True}
-    res = tailor.tailor_with_claude(job)
-    if res["ok"]:
-        return {"pdf": res["pdf"], "reused": False, "attempts": res.get("attempts"),
-                "model": res.get("model"), "escalated": res.get("escalated")}
-    return {"pdf": None, "fail": {"stage": "résumé tailoring", "code": res.get("fail_code"),
-            "reason": res.get("fail_reason"), "log": res.get("log"),
-            "attempts": res.get("attempts")}}
-
-
-def tailor_all_parallel(todo: list, workers: int):
-    """Tailor every shortlisted job's resume CONCURRENTLY up front (the slow claude -p
-    calls), instead of one-at-a-time inside the apply loop. Each job's result is cached
-    on the job dict as job["_resume_pdf"] (None on failure) so get_resume() just reuses
-    it. Tailors are independent (per-job workdirs), so threads are safe. This collapses
-    serial ~N×(minutes-per-resume) into roughly one wave."""
-    if not todo:
-        return
-    workers = max(1, min(workers, len(todo)))
-    log(f"tailoring {len(todo)} resume(s) in parallel (workers={workers})...")
-    bump_watchdog(TAILOR_BUDGET + 600)
-    t0 = time.time()
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_tailor_one, j): j for j in todo}
-        for fut in as_completed(futs):
-            job = futs[fut]
-            try:
-                r = fut.result()
-            except Exception as e:
-                r = {"pdf": None, "fail": {"stage": "résumé tailoring", "code": "crash",
-                     "reason": f"{type(e).__name__}: {e}"}}
-            job["_resume_pdf"] = r["pdf"]
-            done += 1
-            t = (job.get("title", "") or "")[:40]
-            if r["pdf"]:
-                how = "reused" if r.get("reused") else (
-                    "tailored" + (" (Opus)" if r.get("escalated") else ""))
-                log(f"  [{done}/{len(todo)}] ✓ {how}: {t} -> {Path(r['pdf']).name}")
-            else:
-                job["_fail"] = r.get("fail")
-                log(f"  [{done}/{len(todo)}] ✗ tailor FAILED: {t} "
-                    f"[{(r.get('fail') or {}).get('code')}]")
-            bump_watchdog(TAILOR_BUDGET)  # keep the watchdog alive while others finish
-    log(f"parallel tailoring finished in {int(time.time() - t0)}s "
-        f"({sum(1 for j in todo if j.get('_resume_pdf'))}/{len(todo)} ready)")
-
-
-def get_resume(job: dict) -> str | None:
-    """Return a tailored PDF path: reuse if present, else tailor via claude -p.
-    On failure, stash a classified diagnosis on the job for the Telegram alert.
-    Prefers the result of the parallel tailoring wave (job["_resume_pdf"], possibly
-    None on failure); otherwise reuses/tailors inline (the legacy serial path)."""
-    if "_resume_pdf" in job:
-        return job["_resume_pdf"]
-    existing = tailor.latest_pdf(job)
-    if existing:
-        log(f"  using existing tailored resume: {Path(existing).name}")
-        return existing
-    log("  tailoring resume (ResumeBot2.1 via claude -p)...")
-    res = tailor.tailor_with_claude(job)
-    if res["ok"]:
-        esc = " — escalated to Opus" if res.get("escalated") else ""
-        log(f"  tailored: {Path(res['pdf']).name} (attempt {res.get('attempts')}, "
-            f"{res.get('model','?')}{esc})")
-        return res["pdf"]
-    job["_fail"] = {"stage": "résumé tailoring", "code": res.get("fail_code"),
-                    "reason": res.get("fail_reason"), "log": res.get("log"),
-                    "attempts": res.get("attempts")}
-    log(f"  ⚠ tailoring failed after {res.get('attempts')} attempt(s) "
-        f"[{res.get('fail_code')}]: {res.get('fail_reason')}")
-    return None
-
-
 def _alert_failure(job: dict, fail: dict):
     """Telegram the user about a SYSTEM failure + its probable cause. The run is
     deliberately left unmarked so it re-fires live on next login for debugging."""
@@ -539,67 +573,383 @@ def _result(job: dict, status: str, detail: str = "", system_failure: bool = Fal
     return r
 
 
-def process(job: dict, dry_apply: bool) -> dict:
+def _msg(text: str):
+    """Best-effort Telegram message (never raises)."""
+    try:
+        if tg.configured():
+            tg.send_message(text)
+    except Exception as e:
+        log(f"  telegram message failed: {type(e).__name__}: {e}")
+
+
+# ── Big Interview (plan §4A) ─────────────────────────────────────────────────
+
+def _bi(cmd: str, **args) -> dict:
+    """One Big Interview MCP call via bi_scan.py (callers hold SCAN_LOCK). Always
+    returns the MCP envelope {ok, data} / {ok: False, error: {code, message, hint}}."""
+    try:
+        import bi_scan
+    except ImportError as e:
+        return {"ok": False, "error": {"code": "unavailable", "message": str(e), "hint": ""}}
+    return bi_scan.call(cmd, **args)
+
+
+def _bi_err(cmd: str, r: dict) -> str:
+    e = (r or {}).get("error") or {}
+    return (f"⚠️ Big Interview {cmd} failed ({e.get('code', '?')}): {e.get('message', '')}"
+            + (f"\nHint: {e['hint']}" if e.get("hint") else ""))
+
+
+def _scan_button() -> dict | None:
+    """Scan button state, read once per resume card. None → no scan UI (MCP not set
+    up). Never blocks on an in-flight scan: then the button shows without a count."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return {"available": True, "left": None}
+    try:
+        r = _bi("auth")
+    finally:
+        SCAN_LOCK.release()
+    if not r.get("ok"):
+        if (r.get("error") or {}).get("code") == "unavailable":
+            return None
+        return {"available": True, "left": None}  # MCP error surfaces when tapped
+    d = r.get("data") or {}
+    return {"available": bool(d.get("logged_in")), "left": d.get("scans_remaining")}
+
+
+def _record_scan(job: dict, scan_id: str, version: int, medal, items=None):
+    with _scans_lock:
+        try:
+            rows = json.loads(SCANS_FILE.read_text())
+        except Exception:
+            rows = []
+        for r in rows:
+            if r.get("scan_id") == scan_id and r.get("version") == version \
+                    and r.get("job_id") == job["job_id"]:
+                if items is not None:
+                    r["items"] = items
+                break
+        else:
+            rows.append({"job_id": job["job_id"], "scan_id": scan_id, "version": version,
+                         "medal": medal, "date": date.today().isoformat(),
+                         "items": items or []})
+        SCANS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SCANS_FILE.write_text(json.dumps(rows, indent=2))
+
+
+def _limit_reset() -> tuple:
+    """Plan §4A.4 (D17): at 0/5, delete the N oldest scans in My Scans (each delete
+    backs up its feedback first — MCP built-in) and re-check the allowance. Runs at
+    most once per calendar day. Returns (ok, message, scans_left)."""
+    today = date.today().isoformat()
+    if SCAN_RESET_STAMP.exists() and SCAN_RESET_STAMP.read_text().strip() == today:
+        return False, ("Scan allowance is 0/5 and today's reset already ran — scans "
+                       "resume at midnight."), 0
+    SCAN_RESET_STAMP.parent.mkdir(parents=True, exist_ok=True)
+    SCAN_RESET_STAMP.write_text(today)  # stamp FIRST: never twice a day, even on a crash
+    n = int(ra.agent_cfg("bi_reset_delete_count"))
+    scans, cursor = [], None
+    for _ in range(50):  # bounded paging
+        r = _bi("list", limit=50, cursor=cursor)
+        if not r.get("ok"):
+            return False, _bi_err("list", r), 0
+        scans += (r.get("data") or {}).get("scans") or []
+        cursor = (r.get("data") or {}).get("next_cursor")
+        if not cursor:
+            break
+    # Undated rows can't be ordered by age → never deleted.
+    oldest = sorted((x for x in scans if x.get("scanned_at")), key=lambda x: x["scanned_at"])
+    deleted = refused = 0
+    for x in oldest:
+        if deleted >= n:
+            break
+        r = _bi("delete", scan_id=x["scan_id"])
+        if not r.get("ok"):
+            e = r.get("error") or {}
+            # The MCP refuses (before touching the site) to delete the latest loop
+            # result without confirm=true. Never force it — that result may back an
+            # open card; skip to the next oldest instead.
+            if e.get("code") == "invalid_input" and "confirm" in (e.get("hint") or ""):
+                refused += 1
+                continue
+            _msg(_bi_err("delete", r))
+            break
+        deleted += 1
+    log(f"  scan limit reset: deleted {deleted}/{n} oldest scan(s), {refused} refused as latest")
+    if not deleted and refused:
+        SCAN_RESET_STAMP.unlink(missing_ok=True)  # nothing was deleted: don't burn today's reset
+    a = _bi("auth")
+    left = ((a.get("data") or {}).get("scans_remaining") if a.get("ok") else None) or 0
+    if left > 0:
+        _msg(f"♻️ Deleted {deleted} oldest scan(s) (feedback backed up) — allowance now {left}/5.")
+        return True, "", left
+    return False, (f"Deleted {deleted} old scan(s) but the allowance did not reset "
+                   f"({left}/5). Scans resume at midnight."), 0
+
+
+def _run_scan(job: dict, st: dict) -> tuple:
+    """Plan §4A.3 steps 2–7, called under SCAN_LOCK. Returns (feedback, scans_left,
+    error_text). MCP errors are surfaced with their hint and NEVER retried."""
+    bump_watchdog(SCAN_BUDGET)
+    a = _bi("auth")
+    if not a.get("ok"):
+        return None, None, _bi_err("auth", a)
+    d = a.get("data") or {}
+    if not d.get("logged_in"):
+        return None, None, "🔐 Big Interview login expired — run scripts/login.py"
+    left = d.get("scans_remaining")
+    if left == 0:
+        ok, why, left = _limit_reset()
+        if not ok:
+            return None, 0, why
+    s = _bi("start", resume_path=str(Path(st["pdf"]).resolve()),
+            job_title=job.get("title", ""), company=job.get("company", ""),
+            job_description=job.get("description", ""),
+            scoring_guide=ra.agent_cfg("bi_scoring_guide"))
+    if not s.get("ok"):
+        return None, left, _bi_err("start", s)
+    sd = s.get("data") or {}
+    sid, state = sd.get("scan_id"), sd.get("state")
+    left = sd.get("scans_remaining", left)
+    poll = max(BI_MIN_POLL_S, int(ra.agent_cfg("bi_poll_s")))
+    deadline = time.time() + int(ra.agent_cfg("bi_scan_timeout_s"))
+    hint = ""
+    while state != "complete":
+        if state == "failed":
+            return None, left, f"❌ Big Interview reported the scan failed (scan {sid}). {hint}".strip()
+        if state == "unknown":
+            return None, left, (f"❓ Scan state unreadable (scan {sid}) — not retrying. "
+                                f"{hint}").strip()
+        if time.time() + poll > deadline:
+            return None, left, f"⏱️ Scan timed out — scan_id {sid} kept, try again later."
+        time.sleep(poll)
+        r = _bi("status", scan_id=sid)
+        if not r.get("ok"):
+            return None, left, _bi_err("status", r)
+        rd = r.get("data") or {}
+        state, hint = rd.get("state"), rd.get("hint") or ""
+        left = rd.get("scans_remaining", left)
+    f = _bi("feedback", scan_id=sid)
+    if not f.get("ok"):
+        return None, left, _bi_err("feedback", f)
+    return f.get("data") or {}, left, None
+
+
+def _resume_state(job: dict, ctx: dict, res: dict, match, kw, version: int,
+                  round_no: int, prev_scan: str) -> tuple:
+    """Steps 9–10 on a tailored / retailored version. Returns (state | None, post)."""
+    post = ra.verify_tailored_pdf(res["pdf"], res.get("tex"), kw)
+    if not post["ok"]:
+        return None, post
+    tex_text = Path(res["tex"]).read_text() if res.get("tex") and Path(res["tex"]).exists() else ""
+    base = ra.detect_base(tex_text, ctx["base_texts"]) if tex_text else None
+    verdict = ra.build_verdict(
+        ats_status=(ctx["audit"].get(base) or {}).get("status", "green"),
+        match=match, base=base, post=post,
+        xyz=tailor.xyz_bullet_stats(tex_text) if tex_text else None,
+        model=res.get("model", ""), attempts=res.get("attempts"),
+        escalated=res.get("escalated", False))
+    log(f"  verdict v{version}: {verdict}")
+    return {"pdf": res["pdf"], "tex": res.get("tex"), "version": version, "round": round_no,
+            "prev_scan": prev_scan, "verdict": verdict, "match": match, "kw": kw}, post
+
+
+def _scan_summary(fb: dict) -> str:
+    cats = fb.get("categories") or {}
+    return (f"{tg.medal_label(fb.get('medal'))} · "
+            f"ATS Fit: {tg.medal_label((cats.get('ats_fit') or {}).get('badge'))}")
+
+
+def _scan_and_retailor(job: dict, ctx: dict, st: dict):
+    """Plan §4A: scan → score card → (Retailor | Back). Returns the state for the
+    next resume card (same version on Back / any failure, vN+1 after a successful
+    retailor) or "timeout" when the score card got no tap."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        _msg("⏳ Queued — another scan is running.")
+        SCAN_LOCK.acquire()
+    try:
+        fb, left, err = _run_scan(job, st)
+    finally:
+        SCAN_LOCK.release()
+    if err:
+        log(f"  scan: {err}")
+        _msg(err)
+        return st
+    sid = fb.get("scan_id", "")
+    _record_scan(job, sid, st["version"], fb.get("medal"))
+    nonce = uuid.uuid4().hex[:8]
+    card = tg.send_score_card(
+        job, fb, nonce, version=st["version"], scans_left=left, round_no=st["round"],
+        max_rounds=int(ra.agent_cfg("retailor_max_rounds")),
+        max_toggles=int(ra.agent_cfg("bi_max_toggles")),
+        categories=tuple(ra.agent_cfg("bi_correction_categories")))
+    _record_scan(job, sid, st["version"], fb.get("medal"), items=card.selectable)
+    bump_watchdog(APPROVAL_TIMEOUT + RETAILOR_BUDGET + APPLY_BUDGET)
+    dec = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=APPROVAL_TIMEOUT,
+                               refuse=card.refuse)
+    log(f"  score card decision: {dec}")
+    if dec == "timeout":
+        return "timeout"
+    if dec != "retailor":
+        return st  # Back → same version's resume card
+    kws, corrs = card.picked()
+    n = st["version"]
+    if not (st.get("tex") and Path(st["tex"]).exists()):
+        _msg(f"⚠️ Retailor unavailable: v{n}'s .tex is missing — here is v{n} again.")
+        return st
+    _msg(f"🔁 Retailoring v{n} → v{n + 1} with {len(kws)} keyword(s) and "
+         f"{len(corrs)} correction(s)…")
+    bump_watchdog(RETAILOR_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
+    with LLM_SLOTS:
+        res = tailor.retailor(job, st["tex"], kws, corrs)
+    if not res.get("ok"):
+        _msg(f"⚠️ Retailor failed ({res.get('fail_code')}): {res.get('fail_reason')} "
+             f"— here is v{n} again.")
+        return st
+    new, post = _resume_state(job, ctx, res, st["match"], st["kw"], res["version"],
+                              st["round"] + 1, _scan_summary(fb))
+    if new is None:
+        _msg(f"⚠️ Retailored v{res['version']} failed the post-check "
+             f"({', '.join(post.get('failed', []))}) — here is v{n} again.")
+        return st
+    (Path(new["pdf"]).parent / tailor.VALIDATED).touch()  # retry may now restore it
+    return new
+
+
+# ── Per-job worker (Steps 5–14) ──────────────────────────────────────────────
+
+def _run_job(job: dict, ctx: dict, dry_apply: bool) -> dict:
+    """Everything after a posting Approve, for ONE job: Haiku keywords → verify +
+    score → low-match card → tailor → post-check → verdict → resume card (with the
+    scan / retailor loop) → cover letter → apply. Blocks only this job's worker."""
+    jid = job["job_id"]
     title = job.get("title", "")[:55]
-    log(f"JOB: {title} ({job.get('company','')})")
+    bump_watchdog(HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
 
-    # Give this job's tailoring its full budget on the watchdog clock.
-    bump_watchdog(TAILOR_BUDGET + APPLY_BUDGET)
+    # Step 5–6: Haiku keywords + Python verify/score (degrades to Match n/a).
+    d = tailor.stage(job)
+    jd = (d / "job_description.txt").read_text()
+    with LLM_SLOTS:
+        kw = ra.extract_keywords(job, d)
+    match = None
+    if "error" in kw:
+        log(f"  [{title}] keywords: {kw['error']} — Match n/a, tailor extracts its own")
+    else:
+        match = ra.score_keywords(kw, jd, ctx["base_texts"])
+        sc = match["score"]
+        log(f"  [{title}] match: {'n/a' if sc is None else f'{sc:.0%}'} "
+            f"({match['must_hit']}/{match['must_total']} must), dropped={match['dropped']}")
 
-    pdf = get_resume(job)
-    if not pdf:
-        # SYSTEM failure: alert with the probable cause + leave today unmarked.
-        _alert_failure(job, job.get("_fail", {"stage": "résumé tailoring"}))
+    # Step 7: low-match card.
+    if match and match["score"] is not None and match["score"] < float(ra.agent_cfg("min_match_score")):
+        nonce = uuid.uuid4().hex[:8]
+        tg.send_low_match_card(job, match, nonce=nonce)
+        bump_watchdog(LOW_MATCH_TIMEOUT + HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
+        dec = tg.wait_for_decision(jid, nonce=nonce, timeout=LOW_MATCH_TIMEOUT)
+        log(f"  [{title}] low-match decision: {dec}")
+        if dec == "lowno":
+            clear_pending(jid)
+            add_to_skiplist(jid)
+            return _result(job, "skipped_low_match")
+        if dec != "lowok":
+            add_pending(job, "transient", "no low-match tap in time")
+            return _result(job, "timeout", detail="no low-match tap")
+
+    # Step 8: tailor (reuse a 1-page PDF from an earlier run if present).
+    kwpass = ({**match["keywords"], "covered": match["covered"]}
+              if match and match["score"] is not None else None)
+    existing = tailor.latest_pdf(job)
+    if existing:
+        log(f"  [{title}] using existing tailored resume: {Path(existing).name}")
+        res = {"ok": True, "pdf": existing, "tex": existing[:-4] + ".tex",
+               "attempts": 0, "model": "reused", "version": tailor.version_of(existing)}
+    else:
+        bump_watchdog(HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
+        with LLM_SLOTS:
+            res = tailor.tailor_with_claude(job, keywords=kwpass)
+    if not res["ok"]:
+        fail = {"stage": "résumé tailoring", "code": res.get("fail_code"),
+                "reason": res.get("fail_reason"), "log": res.get("log"),
+                "attempts": res.get("attempts")}
+        log(f"  [{title}] ⚠ tailoring failed [{fail['code']}]: {fail['reason']}")
+        _alert_failure(job, fail)
         return _result(job, "tailor_failed", system_failure=True)
 
-    if not tg.configured():
-        log("  ⚠ Telegram not configured — cannot request approval. "
-            "Add TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to .env.")
-        return _result(job, "no_telegram", extra={"resume": pdf})
+    # Steps 9–10: post-check + verdict.
+    # Each successful retailor is +1 version and +1 round, so a reused vN is round N-1.
+    v = res.get("version", 1)
+    st, post = _resume_state(job, ctx, res, match, kwpass, v, v - 1, "")
+    if st is None:
+        # Quarantine so tailor.latest_pdf() (glob Resume_*.pdf) won't reuse it next run.
+        bad = Path(res["pdf"])
+        if bad.exists():
+            bad.rename(bad.with_name("POSTCHECK_FAILED_" + bad.name))
+        _alert_failure(job, {"stage": "post-check", "code": "postcheck_failed",
+                             "reason": f"tailored PDF failed critical ATS checks: "
+                                       f"{', '.join(post.get('failed', []))}",
+                             "attempts": res.get("attempts")})
+        return _result(job, "postcheck_failed", system_failure=True)
 
+    # Step 11 (+ §4A loop): resume card until Approve / Reject / timeout.
+    max_rounds = int(ra.agent_cfg("retailor_max_rounds"))
+    while True:
+        nonce = uuid.uuid4().hex[:8]
+        tg.send_resume_for_approval(st["pdf"], job, summary=st["verdict"], nonce=nonce,
+                                    scan=_scan_button(), version=st["version"],
+                                    round_no=st["round"], max_rounds=max_rounds,
+                                    prev_scan=st["prev_scan"])
+        bump_watchdog(APPROVAL_TIMEOUT + SCAN_BUDGET + APPLY_BUDGET + 120)
+        dec = tg.wait_for_decision(jid, nonce=nonce, timeout=APPROVAL_TIMEOUT)
+        log(f"  [{title}] resume decision (v{st['version']}): {dec}")
+        if dec == "approve":
+            break
+        if dec == "scan":
+            nxt = _scan_and_retailor(job, ctx, st)
+            if nxt == "timeout":
+                add_pending(job, "transient", "no score-card tap in time")
+                return _result(job, "timeout", detail="no score-card tap")
+            st = nxt
+            continue
+        if dec == "timeout":
+            add_pending(job, "transient", "no approval tap in time")
+            return _result(job, "timeout")
+        clear_pending(jid)
+        add_to_skiplist(jid)  # prevent re-presentation in wider scrape window
+        return _result(job, dec)
+
+    if st["version"] > 1 and st.get("tex"):
+        tailor.consolidate(Path(st["pdf"]), Path(st["tex"]))
+    # The PDF submitted is always the version on the card that was approved.
+    return _apply(job, st["pdf"], dry_apply)
+
+
+def _apply(job: dict, pdf: str, dry_apply: bool) -> dict:
+    """Steps 12–14: cover letter (own approval) → NUworks apply → external links.
+    The browser steps (13–14) run under APPLY_LOCK: one browser session at a time.
+    The cover letter (claude -p + a human wait) stays outside the lock so a pending
+    approval never blocks other jobs' applies."""
+    title = job.get("title", "")[:55]
     label = tailor.expected_basename(job)
-    log("  sending to Telegram for approval...")
-    # Per-send nonce: the Approve/Reject buttons carry it, and wait_for_decision
-    # only accepts a tap whose nonce matches THIS send. A stale tap on an old
-    # message (e.g. from a prior run) can no longer auto-submit a newly tailored
-    # resume the user never reviewed (C5).
-    nonce = uuid.uuid4().hex[:8]
-    tg.send_resume_for_approval(pdf, job, nonce=nonce)
-    # An approval can legitimately take up to APPROVAL_TIMEOUT — extend the
-    # watchdog so the human wait never counts as a "hang".
-    bump_watchdog(APPROVAL_TIMEOUT + APPLY_BUDGET + 120)
-    decision = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=APPROVAL_TIMEOUT)
-    log(f"  decision: {decision}")
-
-    if decision == "timeout":
-        # Didn't answer in time — re-queue so it's offered again next run instead
-        # of being lost forever (the scrape only looks back 24h). H5.
-        add_pending(job, "transient", "no approval tap in time")  # report consolidates this
-        return _result(job, "timeout")
-    if decision != "approve":
-        clear_pending(job["job_id"])
-        add_to_skiplist(job["job_id"])  # prevent re-presentation in wider scrape window
-        return _result(job, decision)
 
     # Cover letter — only generate one when the job actually requires it.
     cover_pdf = None
     if cover_letter.needs_cover_letter(job.get("_required_docs")):
-        log("  cover letter required — generating (from JD + tailored resume)...")
+        log(f"  [{title}] cover letter required — generating (from JD + tailored resume)...")
         bump_watchdog(TAILOR_BUDGET + APPLY_BUDGET)
         resume_src = pdf.replace(".pdf", ".tex") if Path(pdf.replace(".pdf", ".tex")).exists() else pdf
-        cl = cover_letter.generate_with_claude(job, resume_src)
+        with LLM_SLOTS:
+            cl = cover_letter.generate_with_claude(job, resume_src)
         cover_pdf = cl.get("pdf")
         if cover_pdf:
-            log(f"  cover letter: generated {Path(cover_pdf).name}")
+            log(f"  [{title}] cover letter: generated {Path(cover_pdf).name}")
             # C6: a required cover letter is generated by claude -p; send it for its
             # OWN Approve/Reject so it's never submitted to an employer sight-unseen.
             cl_nonce = uuid.uuid4().hex[:8]
-            log("  sending cover letter to Telegram for approval...")
             tg.send_cover_letter_for_approval(cover_pdf, job, nonce=cl_nonce)
             bump_watchdog(APPROVAL_TIMEOUT + APPLY_BUDGET + 120)
             cl_decision = tg.wait_for_decision(job["job_id"], nonce=cl_nonce,
                                                timeout=APPROVAL_TIMEOUT)
-            log(f"  cover letter decision: {cl_decision}")
+            log(f"  [{title}] cover letter decision: {cl_decision}")
             if cl_decision == "timeout":
                 add_pending(job, "transient", "no cover-letter approval tap in time")
                 return _result(job, "cover_letter_timeout")
@@ -608,74 +958,269 @@ def process(job: dict, dry_apply: bool) -> dict:
                 return _result(job, "cover_letter_rejected")
         else:
             # Required cover letter could not be produced -> system failure.
-            job["_fail"] = {"stage": "cover letter", "code": cl.get("fail_code"),
-                            "reason": cl.get("fail_reason"), "log": cl.get("log"),
-                            "attempts": cl.get("attempts")}
-            log(f"  ⚠ cover letter FAILED [{cl.get('fail_code')}]: {cl.get('fail_reason')}")
-            _alert_failure(job, job["_fail"])
+            fail = {"stage": "cover letter", "code": cl.get("fail_code"),
+                    "reason": cl.get("fail_reason"), "log": cl.get("log"),
+                    "attempts": cl.get("attempts")}
+            log(f"  [{title}] ⚠ cover letter FAILED [{cl.get('fail_code')}]: {cl.get('fail_reason')}")
+            _alert_failure(job, fail)
             return _result(job, "cover_letter_failed", system_failure=True)
 
     mode = "dry" if dry_apply else "submit"
     transcript = str(TRANSCRIPT) if TRANSCRIPT.exists() else None
-    bump_watchdog(APPLY_BUDGET)
-    log(f"  auto-applying (mode={mode}, transcript={'yes' if transcript else 'no'}, "
-        f"cover_letter={'yes' if cover_pdf else 'no'})...")
-    res = asyncio.run(auto_apply.apply_to_job(job["job_id"], pdf, label, mode=mode,
-                                              transcript_pdf=transcript,
-                                              cover_letter_pdf=cover_pdf))
-    log(f"  apply result: {res['status']} — {res['detail']}")
-    if res["status"] == "applied":
-        clear_pending(job["job_id"])  # definitively done — drop from the re-queue
+    with APPLY_LOCK:
+        bump_watchdog(APPLY_BUDGET * 2)
+        log(f"  [{title}] auto-applying (mode={mode}, transcript={'yes' if transcript else 'no'}, "
+            f"cover_letter={'yes' if cover_pdf else 'no'})...")
+        res = asyncio.run(auto_apply.apply_to_job(job["job_id"], pdf, label, mode=mode,
+                                                  transcript_pdf=transcript,
+                                                  cover_letter_pdf=cover_pdf))
+        log(f"  [{title}] apply result: {res['status']} — {res['detail']}")
+        if res["status"] == "applied":
+            clear_pending(job["job_id"])  # definitively done — drop from the re-queue
 
-    # submitted_unverified: Submit was clicked but neither the page text nor the portal
-    # flag confirmed it. Re-queue as verify_gap + keep the day MARKED (not a system
-    # failure): the supervisor re-checks next run and the double-apply guard makes a
-    # re-apply safe (it skips if the portal now shows applied). The consolidated report
-    # surfaces it under "retrying"; leaving the day unmarked would re-fire forever.
-    if res["status"] == "submitted_unverified":
-        add_pending(job, "verify_gap", res["detail"])
-        return _result(job, "submitted_unverified", detail=res["detail"])
+        # submitted_unverified: Submit was clicked but neither the page text nor the
+        # portal flag confirmed it. Re-queue as verify_gap + keep the day MARKED (not a
+        # system failure): the supervisor re-checks next run and the double-apply guard
+        # makes a re-apply safe.
+        if res["status"] == "submitted_unverified":
+            add_pending(job, "verify_gap", res["detail"])
+            return _result(job, "submitted_unverified", detail=res["detail"])
 
-    # (per-job outcome ping removed — the supervisor's consolidated report covers applied /
-    # blocked / retrying outcomes; see the run_supervisor hook at the end of main().)
-    # A portal error (not a clean terminal state) is a system failure -> retry live.
-    if res["status"] == "error":
-        return _result(job, "error", detail=res["detail"], system_failure=True)
+        # A portal error (not a clean terminal state) is a system failure -> retry live.
+        if res["status"] == "error":
+            return _result(job, "error", detail=res["detail"], system_failure=True)
 
-    # External apply links from the posting — auto-fill + Telegram submit-gate.
-    # external_autofill fills every mappable field from profile.json, sends you
-    # the values + a Submit button, self-heals validation errors on your tap, and
-    # stacks captcha/login-wall jobs for the laptop (never auto-solves captchas).
-    ext = [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
-    for u in ext:
-        # The in-portal apply already succeeded above; an error in the external
-        # step (tracking OR autofill) must stay isolated to this link and never
-        # bubble up to fail the whole job. track() is inside the try too — a bad
-        # record once crashed it BEFORE process_job ran, dropping the apply.
-        try:
-            external_apply.track(job, u, external_apply.detect_ats(u), "tracked",
-                                 "external apply link from NUworks posting")
-            external_autofill.process_job(
-                u, resume_path=pdf, dry=dry_apply,
-                job_meta={"title": job.get("title", ""), "company": job.get("company", "")})
-        except Exception as e:
-            log(f"  external autofill error for {u}: {e}")
+        # External apply links from the posting — auto-fill + Telegram submit-gate
+        # (external_autofill never auto-solves captchas or creates accounts).
+        ext = [u.strip() for u in (job.get("apply_urls", "") or "").split(";") if u.strip()]
+        for u in ext:
+            # An error in the external step must stay isolated to this link and never
+            # fail the whole job (the in-portal apply already succeeded above).
             try:
-                tg.send_message(f"⚠️ External autofill error for {title} ({u}). "
-                                "Tracked — finish this one manually.")
-            except Exception:
-                pass
-    if ext:
-        log(f"  external apply links handled: {ext}")
+                external_apply.track(job, u, external_apply.detect_ats(u), "tracked",
+                                     "external apply link from NUworks posting")
+                external_autofill.process_job(
+                    u, resume_path=pdf, dry=dry_apply,
+                    job_meta={"title": job.get("title", ""), "company": job.get("company", "")})
+            except Exception as e:
+                log(f"  external autofill error for {u}: {e}")
+                _msg(f"⚠️ External autofill error for {title} ({u}). "
+                     "Tracked — finish this one manually.")
+        if ext:
+            log(f"  [{title}] external apply links handled: {ext}")
 
     return _result(job, res["status"], detail=res["detail"], extra={"external": ext})
 
 
+def _crash_result(job: dict, e: Exception) -> dict:
+    """A crash in one job must NOT abort the others (H1); it's a system failure."""
+    import traceback
+    jt = (job.get("title", "?") or "?")[:55]
+    log(f"  ✗ UNHANDLED error on {jt}: {type(e).__name__}: {e}")
+    log("".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:])
+    _msg(f"🛑 Crashed while processing <b>{jt}</b>\n"
+         f"<code>{type(e).__name__}: {str(e)[:200]}</code>\n\n"
+         "Day left unmarked → it'll retry live next login.")
+    return _result(job, "crashed", system_failure=True)
+
+
+def _posting_worker(job: dict, nonce: str, ctx: dict, dry_apply: bool) -> dict:
+    """Wait on ONE posting card; an Approve starts that job's pipeline right away."""
+    try:
+        dec = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=POSTING_TIMEOUT)
+        log(f"JOB: {job.get('title', '')[:55]} ({job.get('company', '')})  posting decision: {dec}")
+        if dec == "approve":
+            try:
+                return _run_job(job, ctx, dry_apply)
+            except Exception as e:
+                return _crash_result(job, e)
+        if dec == "timeout":
+            add_pending(job, "transient", "no posting-approval tap in time")
+            return _result(job, "timeout")
+        clear_pending(job["job_id"])
+        if not job.get("_manual"):  # a hand-picked posting isn't a verdict on the posting
+            add_to_skiplist(job["job_id"])
+        return _result(job, dec)
+    finally:
+        with _active_lock:
+            _active_ids.discard(job["job_id"])
+
+
+def run_postings(todo: list, ctx: dict, dry_apply: bool) -> list:
+    """Step 4 + per-job workers: send EVERY posting card at once, then each card's
+    Approve starts Steps 5–14 for that job immediately, in parallel (plan §5)."""
+    results = []
+    started = not tg.DISPATCHER.running  # main() may already own it for the whole run
+    tg.DISPATCHER.start()
+    try:
+        bump_watchdog(POSTING_TIMEOUT + HYBRID_BUDGET + APPROVAL_TIMEOUT
+                      + APPLY_BUDGET * max(1, len(todo)) + 300)
+        futs = {}
+        with ThreadPoolExecutor(max_workers=max(1, len(todo))) as ex:
+            for job in todo:
+                nonce = uuid.uuid4().hex[:8]
+                with _active_lock:  # a /apply may already own this posting
+                    if job["job_id"] in _active_ids:
+                        log(f"  skip {job.get('title', '')[:50]}: already has a card (/apply)")
+                        continue
+                    _active_ids.add(job["job_id"])
+                try:
+                    tg.send_job_for_approval(job, nonce=nonce)
+                except Exception as e:
+                    with _active_lock:
+                        _active_ids.discard(job["job_id"])
+                    log(f"  posting card send failed for {job.get('title', '')[:50]}: {e}")
+                    add_pending(job, "transient", "posting card send failed")
+                    results.append(_result(job, "timeout", detail="posting card send failed"))
+                    continue
+                # start the worker now so an early Approve doesn't wait on later sends
+                futs[ex.submit(_posting_worker, job, nonce, ctx, dry_apply)] = job
+            log(f"sent {len(futs)} posting card(s)")
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    results.append(_crash_result(futs[fut], e))
+    finally:
+        if started:
+            tg.DISPATCHER.stop()
+    return results
+
+
+_active_ids: set = set()        # job_ids with a live posting card this run
+_active_lock = threading.Lock()
+_ctx_lock = threading.Lock()
+_ctx_cache: dict = {}           # {"v": ctx|None} — one base-resume audit per run
+_scrape_lock = threading.Lock() # one scrape/DUO login at a time (main's vs a manual job's)
+_manual_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="manual")
+_manual_futs: list = []
+_manual_lock = threading.Lock()
+_closing = False                # main() is past the join point: no new manual jobs
+_dry_apply = False              # set by main() so manual jobs honor --dry-apply
+
+
+def _get_ctx() -> dict | None:
+    """audit_or_stop() once per run, shared by run_postings and manual jobs."""
+    with _ctx_lock:
+        if "v" not in _ctx_cache:
+            _ctx_cache["v"] = audit_or_stop()
+        return _ctx_cache["v"]
+
+
+def _submit_manual(job_id: str) -> bool:
+    """Queue a /apply job into this run; False once main() has closed the join."""
+    with _manual_lock:
+        if _closing:
+            return False
+        _manual_futs.append(_manual_pool.submit(_manual_job, job_id))
+        return True
+
+
+def _join_manual() -> list:
+    """Wait for manual jobs; the run stays open to new /apply until none is in flight,
+    then closes (late ones go to the queue file for the next run)."""
+    global _closing
+    out, seen = [], 0
+    while True:
+        with _manual_lock:
+            todo = _manual_futs[seen:]
+            if not todo:
+                _closing = True
+                return out
+        seen += len(todo)
+        wait(todo)
+        for f in todo:
+            try:
+                r = f.result()
+            except Exception as e:
+                log(f"  manual job crashed: {type(e).__name__}: {e}")
+                continue
+            if r:
+                out.append(r)
+
+
+def _manual_job(job_id: str) -> dict | None:
+    """/apply <id>: one hand-picked posting through the normal card → tailor → apply
+    flow. Returns a result for the summary/supervisor, or None when nothing was
+    attempted (couldn't load, duplicate card, base resume red)."""
+    claimed = False
+    try:
+        bump_watchdog(POSTING_TIMEOUT + HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET + 300)
+        url = tg.job_posting_url(job_id)
+        job = apply_type.fetch_job(job_id)
+        if job is None:  # expired session or bad id — one DUO re-login, then retry
+            with _scrape_lock:
+                job = apply_type.fetch_job(job_id)  # a scrape we waited on may have fixed it
+                if job is None and scrape_with_duo_retry(mark_skip=False):
+                    job = apply_type.fetch_job(job_id)
+        if job is None:
+            _msg(f"❌ Couldn't load posting {job_id}\n{url}")
+            return None
+        kind = job["_apply_type"]
+        if kind != "in_portal":
+            target = job.get("_apply_target")
+            _msg(f"ℹ️ Can't auto-apply to <b>{html.escape(job['title'][:80])}</b>: {kind}"
+                 + (f" → {html.escape(str(target))}" if target else "") + f"\n{url}")
+            return _result(job, {"already_applied": "already_applied",
+                                 "external": "external"}.get(kind, "no_inportal_apply"))
+        with _active_lock:
+            dup = job_id in _active_ids
+            if not dup:
+                _active_ids.add(job_id)
+                claimed = True
+        if dup:
+            _msg("⏳ That posting already has a card in this run — see above.")
+            return None
+        job["_manual"] = True
+        ctx = _get_ctx()
+        if ctx is None:
+            return None  # audit_or_stop already alerted
+        nonce = uuid.uuid4().hex[:8]
+        try:
+            tg.send_job_for_approval(job, nonce=nonce)
+        except Exception as e:
+            log(f"  posting card send failed for {job.get('title', '')[:50]}: {e}")
+            add_pending(job, "transient", "posting card send failed")
+            return _result(job, "timeout", detail="posting card send failed")
+        return _posting_worker(job, nonce, ctx, _dry_apply)  # releases the claim itself
+    except Exception as e:
+        log(f"  /apply {job_id[:8]} failed: {type(e).__name__}: {e}")
+        _msg(f"⚠️ /apply failed: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:200])}</code>")
+        return None
+    finally:
+        if claimed:
+            with _active_lock:
+                _active_ids.discard(job_id)
+
+
+def audit_or_stop() -> dict | None:
+    """Step 3: base ATS audit once per run, before any card. Any red → ONE alert and
+    the run stops (day unmarked). Returns ctx {audit, base_texts} or None."""
+    bump_watchdog(ATS_AUDIT_BUDGET)
+    audit = ra.audit_bases_cached()
+    for name, a in audit.items():
+        log(f"  base ATS audit: {name} → {a['status']}{' (cached)' if a.get('cached') else ''}")
+    red = {n: a for n, a in audit.items() if a["status"] == "red"}
+    if red:
+        detail = "; ".join(f"{n}: {', '.join(a['report'].get('failed', []))}" for n, a in red.items())
+        log(f"Base resume(s) fail ATS checks — stopping, day unmarked: {detail}")
+        _msg(f"🛑 Base resume fails ATS checks: {detail}. Fix the template. "
+             "Day left unmarked.")
+        return None
+    tailor.BASE_OVERRIDES.clear()
+    tailor.BASE_OVERRIDES.update({n: a["usable_tex"] for n, a in audit.items()
+                                  if a["status"] == "yellow"})
+    return {"audit": audit,
+            "base_texts": {n: Path(a["usable_tex"]).read_text() for n, a in audit.items()}}
+
+
 def main():
+    global _dry_apply
     args = sys.argv[1:]
     do_scrape = "--no-scrape" not in args
     dry_apply = "--dry-apply" in args
     force = "--force" in args
+    _dry_apply = dry_apply
     limit = None
     if "--limit" in args:
         limit = int(args[args.index("--limit") + 1])
@@ -684,6 +1229,10 @@ def main():
     log("NUworks auto-apply pipeline starting")
     log(f"telegram configured: {tg.configured()} | dry_apply: {dry_apply} | force: {force}")
 
+    if PAUSE_FLAG.exists():
+        log("Paused via Telegram /pause — skipping this run.")
+        return
+
     # Refuse to run if another instance is already active (e.g. a previous slot
     # still waiting on a Telegram approval). Prevents overlapping runs from
     # double-submitting or stealing each other's Telegram taps.
@@ -691,10 +1240,18 @@ def main():
         log("Another pipeline run is already active (lock held) — exiting.")
         return
 
+    # /apply postings queued by control_bot. Manual mode (just those jobs: no scrape or
+    # scheduled queue, today's scheduled run stays open) only when an /apply started this
+    # run (flag) or the day is already done; otherwise they ride along with a normal run.
+    queued = tg.drain_apply_queue() if tg.configured() else []
+    flagged = tg.MANUAL_FLAG.exists()
+    tg.MANUAL_FLAG.unlink(missing_ok=True)
+    manual_mode = bool(queued) and (flagged or (already_ran_today() and not force))
+
     # Once-per-day guard: the LaunchAgent fires at 10:00 AND on every login
     # (RunAtLoad), so a run missed while the Mac was off catches up at next
     # power-on — but only the first run of the day actually proceeds.
-    if already_ran_today() and not force:
+    if not manual_mode and already_ran_today() and not force:
         log("Already ran today — skipping (use --force to override).")
         return
 
@@ -702,50 +1259,60 @@ def main():
     # deadline is extended phase-by-phase as we go; if it's ever passed the run
     # is aborted WITHOUT marking the day, so it retries live on next login.
     _start_watchdog(SCRAPE_BUDGET)
+    events.instrument(sys.modules[__name__])  # live trace for the pipeline-live pane
 
-    if do_scrape and not scrape_with_duo_retry():
-        return  # skipped / no response / non-DUO failure — stop here
+    # Own getUpdates for the whole run so Telegram /stop works in every phase
+    # (scrape, DUO wait, tailoring, apply). control_bot.py yields while we hold the lock.
+    if tg.configured():
+        tg.DISPATCHER.on_command = _on_command
+        tg.DISPATCHER.start()
+        atexit.register(tg.DISPATCHER.stop)
 
-    bump_watchdog(180)  # classification / parsing headroom
+    for jid in queued:
+        _submit_manual(jid)
+    if manual_mode:
+        log(f"Manual mode: {len(queued)} queued /apply posting(s) — skipping scrape and the "
+            "scheduled queue; today's scheduled run stays open.")
+        jobs, todo = [], []
+    else:
+        if queued:
+            log(f"{len(queued)} queued /apply posting(s) join this run.")
+        if do_scrape:
+            with _scrape_lock:
+                scraped = scrape_with_duo_retry()
+            if not scraped:
+                _join_manual()  # a mid-run /apply may already hold a card
+                return  # skipped / no response / non-DUO failure — stop here
 
-    jobs = load_jobs()
-    log(f"Loaded {len(jobs)} jobs from CSV")
+        bump_watchdog(180)  # classification / parsing headroom
 
-    todo = eligible(jobs)  # also classifies every job (sets _apply_type) for the alert
-    # Heads-up on freshly-found postings (title/company/type), deduped across slots.
-    stats.announce_new_postings(jobs)
-    todo = merge_pending(todo)  # re-add jobs whose approval timed out previously (H5)
-    if limit:
-        todo = todo[:limit]
-    log(f"{len(todo)} in-portal jobs to process")
+        jobs = load_jobs()
+        log(f"Loaded {len(jobs)} jobs from CSV")
 
-    # Tailor ALL resumes concurrently up front (the slow claude -p calls), right
-    # after the jobs are scraped + classified — instead of one-at-a-time inside the
-    # apply loop. Each job's PDF is cached on job["_resume_pdf"]; get_resume() reuses
-    # it. Collapses serial N×(minutes-per-resume) into ~one wave (mirrors handshake).
-    tailor_all_parallel(todo, TAILOR_PARALLELISM)
+        todo = eligible(jobs)  # also classifies every job (sets _apply_type) for the alert
+        # Heads-up on freshly-found postings (title/company/type), deduped across slots.
+        stats.announce_new_postings(jobs)
+        todo = merge_pending(todo)  # re-add jobs whose approval timed out previously (H5)
+        if limit:
+            todo = todo[:limit]
+        log(f"{len(todo)} in-portal jobs to process")
 
-    # Crash-proof each job: a transient Telegram/network/Playwright error in one
-    # job must NOT abort the whole day's remaining jobs (H1). A crash is treated
-    # as a system failure so the day is left unmarked and retries next login.
-    results = []
-    for j in todo:
-        try:
-            results.append(process(j, dry_apply))
-        except Exception as e:
-            import traceback
-            jt = (j.get("title", "?") or "?")[:55]
-            log(f"  ✗ UNHANDLED error on {jt}: {type(e).__name__}: {e}")
-            log(traceback.format_exc())
-            try:
-                if tg.configured():
-                    tg.send_message(
-                        f"🛑 Crashed while processing <b>{jt}</b>\n"
-                        f"<code>{type(e).__name__}: {str(e)[:200]}</code>\n\n"
-                        "Day left unmarked → it'll retry live next login.")
-            except Exception:
-                pass
-            results.append(_result(j, "crashed", system_failure=True))
+    # Step 3–14: no LLM sees a JD before its posting Approve. Without Telegram there
+    # is no human gate, so nothing is tailored at all.
+    if not todo:
+        results = []
+    elif not tg.configured():
+        log("  ⚠ Telegram not configured — cannot ask for posting approval; nothing tailored.")
+        results = [_result(j, "no_telegram") for j in todo]
+    else:
+        ctx = _get_ctx()
+        if ctx is None:
+            _join_manual()
+            return  # base resume red → alert sent, day unmarked
+        results = run_postings(todo, ctx, dry_apply)
+
+    # Mid-run /apply jobs (and manual mode's own) join this run's summary.
+    results += _join_manual()
 
     log("=" * 55)
     log("SUMMARY:")
@@ -756,7 +1323,12 @@ def main():
     # cover-letter / apply step broke, leave today unmarked so the run re-fires
     # live next login (the user can then watch where it breaks).
     failures = [r for r in results if r.get("system_failure")]
-    if failures:
+    marked = not failures and not manual_mode
+    if manual_mode:
+        log("Manual run — today's scheduled run left open (not marked).")
+        if not results:
+            return
+    elif failures:
         log(f"{len(failures)} system failure(s) — leaving today UNMARKED so the run "
             "retries live on next login.")
     else:
@@ -764,7 +1336,7 @@ def main():
         log("Run clean — marked as done for today.")
 
     # Record this run's outcomes for the nightly digest (best-effort).
-    stats.record_run(jobs, results, marked=not failures)
+    stats.record_run(jobs, results, marked=marked)
 
     # Supervisor: classify every outcome, break doomed retry loops (evict un-satisfiable
     # jobs to data/wontfix.json so eligible()/merge_pending() stop re-offering them), and
@@ -773,7 +1345,7 @@ def main():
     # wrapped so a supervisor error never fails the run. Brain stays OFF for this port.
     try:
         import supervisor
-        supervisor.run_supervisor(results, marked=not failures, use_brain=False)
+        supervisor.run_supervisor(results, marked=marked, use_brain=False)
     except Exception as e:
         log(f"supervisor hook error (run still completed): {type(e).__name__}: {e}")
 
