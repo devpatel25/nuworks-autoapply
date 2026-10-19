@@ -497,6 +497,18 @@ class TestRetailor(TailorBase):
         for loc in ("Multiple Locations", "", "Remote"):
             self.assertIn("unchanged", T.header_location({"location": loc}))
 
+    def test_latest_pdf_restores_newest_validated_version(self):
+        for v in ("v2", "v3"):
+            (self.d / v).mkdir()
+            (self.d / v / "Resume_MLIntern_Foo.pdf").write_bytes(b"%PDF")
+        (self.d / "Resume_MLIntern_Foo.pdf").write_bytes(b"%PDF")
+        (self.d / "v2" / T.VALIDATED).touch()     # v3 never passed the post-check
+        one = unittest.mock.Mock(stdout="Pages:          1\n")
+        with patch.object(T.subprocess, "run", return_value=one):
+            got = T.latest_pdf(self.job)
+        self.assertEqual(Path(got), self.d / "v2" / "Resume_MLIntern_Foo.pdf")
+        self.assertEqual(T.version_of(got), 2)
+
     def test_nothing_picked(self):
         with patch.object(T.claude_runner, "run_claude_p") as cl:
             r = T.retailor(self.job, self.v1, [], [])
@@ -512,6 +524,43 @@ class TestSystemInstructions(unittest.TestCase):
             self.assertIn(h, s)
         self.assertIn("MUST integrate every keyword", s)          # D12 kept as-is
         self.assertIn("use it as the extracted list and skip extraction", s)
+
+    def test_no_summary_and_project_bank(self):
+        s = (ROOT / "resume_templates" / "system_instructions.md").read_text()
+        self.assertIn("### 4A — Headline (NO Summary section)", s)
+        self.assertNotIn("Summary is under 50 words", s)
+        self.assertIn("NO Summary section", T.gen_prompt("R.tex"))
+        self.assertNotIn("trim the Summary", T._trim_prompt("R.tex", 2))
+        with tempfile.TemporaryDirectory() as td:
+            ins, bank = Path(td) / "i.md", Path(td) / "b.md"
+            ins.write_text("INSTR")
+            with patch.object(T, "INSTRUCTIONS", ins), patch.object(T, "PROJECT_BANK", bank):
+                self.assertTrue(T.load_instructions().startswith("INSTR"))  # no bank
+                self.assertNotIn("Project Bank", T.load_instructions())
+                self.assertIn("ignore every compile", T.load_instructions())
+                bank.write_text("## APPENDIX: Project Bank")
+                self.assertIn("## APPENDIX: Project Bank", T.load_instructions())
+
+    @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("pdftotext"), "needs TeX")
+    def test_page2_spill_feeds_trim_prompt(self):
+        base = ROOT / "resume_templates" / "Resume_AI-ML_General.tex"
+        if not base.exists():
+            self.skipTest("personal template not present")
+        with tempfile.TemporaryDirectory() as td:
+            ok = Path(td) / "ok.tex"; ok.write_text(base.read_text())
+            pdf, pages = T.compile_tex(ok)
+            self.assertEqual((pages, T.page2_spill(pdf)[0]), (1, 0))
+            over = Path(td) / "over.tex"
+            over.write_text(base.read_text().replace(
+                "\\end{document}", "\\vspace*{40mm}SPILLMARK\n\\end{document}"))
+            pdf, pages = T.compile_tex(over)
+            n, text = T.page2_spill(pdf)
+            self.assertEqual(pages, 2)
+            self.assertGreater(n, 0)
+            self.assertIn("SPILLMARK", text)
+            prompt = T._trim_prompt("R.tex", 2, n, text)
+            self.assertIn(f"free AT LEAST {n} whole", prompt)
+            self.assertIn("SPILLMARK", prompt)
 
 
 # ── Phase 3: Telegram ────────────────────────────────────────────────────────
@@ -775,6 +824,19 @@ class TestLowMatchCard(unittest.TestCase):
 # ── Phase 4: pipeline wiring ─────────────────────────────────────────────────
 import threading  # noqa: E402
 import pipeline as P  # noqa: E402
+
+
+_REAL_LOG_DIR = P.LOG_DIR
+
+
+def setUpModule():
+    """Keep pipeline.log() out of the real logs/run_<date>.log."""
+    P.LOG_DIR = Path(tempfile.mkdtemp())
+
+
+def tearDownModule():
+    shutil.rmtree(P.LOG_DIR, ignore_errors=True)
+    P.LOG_DIR = _REAL_LOG_DIR
 
 
 class PipeBase(unittest.TestCase):
@@ -1091,6 +1153,34 @@ class TestLimitReset(PipeBase):
         self.assertIn("already ran", msg2)
         self.assertEqual(bi.calls.count("delete"), 5)            # second call deleted nothing
 
+    def test_latest_refusal_skipped_and_does_not_burn_stamp(self):
+        refuse = env(err={"code": "invalid_input", "message": "latest loop result",
+                          "hint": "Pass confirm=true to delete it anyway."})
+        # Only refusals → nothing deleted, today's reset stays available.
+        bi = FakeBI({"list": env({"scans": self.SCANS[:1], "next_cursor": None}),
+                     "delete": refuse, "auth": env({"logged_in": True, "scans_remaining": 0})})
+        with patch.object(P, "_bi", bi):
+            ok, _, _ = P._limit_reset()
+        self.assertFalse(ok)
+        self.assertFalse(P.SCAN_RESET_STAMP.exists())
+        # A refused latest is skipped (never forced), the next oldest still deleted.
+        deleted = []
+
+        def bi2(cmd, **kw):
+            if cmd == "delete":
+                self.assertNotIn("confirm", kw)
+                if kw["scan_id"] == "s7":
+                    return refuse
+                deleted.append(kw["scan_id"])
+                return env({"deleted": True})
+            return self.bi(True)(cmd, **kw)
+
+        with patch.object(P, "_bi", bi2):
+            ok, _, left = P._limit_reset()
+        self.assertTrue(ok)
+        self.assertEqual(deleted, ["s6", "s5", "s4", "s3", "s2"])
+        self.assertTrue(P.SCAN_RESET_STAMP.exists())
+
 
 class TestRetailorFlow(PipeBase):
     ST = TestScan.ST
@@ -1120,7 +1210,7 @@ class TestRetailorFlow(PipeBase):
     def test_retailor_success_new_version_and_round(self):
         tex = self.tmp / "r.tex"; tex.write_text("x")
         st = {**self.ST, "tex": str(tex)}
-        new_res = {"ok": True, "pdf": "/v2.pdf", "tex": str(tex), "version": 2, "attempts": 1,
+        new_res = {"ok": True, "pdf": str(self.tmp / "v2.pdf"), "tex": str(tex), "version": 2, "attempts": 1,
                    "model": "claude-sonnet-4-6"}
         fb = {"scan_id": "s", "medal": "silver", "categories": {"ats_fit": {"badge": "bronze"}}}
         with patch.object(P, "_run_scan", return_value=(fb, 2, None)), self.card_patch(), \
@@ -1129,6 +1219,7 @@ class TestRetailorFlow(PipeBase):
              patch.object(P.ra, "verify_tailored_pdf", return_value={"ok": True, "notes": [], "failed": []}):
             out = P._scan_and_retailor(self.job, {"audit": {}, "base_texts": {}}, st)
         self.assertEqual((out["version"], out["round"]), (2, 1))
+        self.assertTrue((self.tmp / T.VALIDATED).exists())          # retry may restore v2
         self.assertEqual(out["prev_scan"], "🥈 Silver · ATS Fit: 🥉 Bronze")
         self.assertEqual(rt.call_args.args[2:], (["Kubernetes"], []))   # only ticked items
         rows = json.loads(P.SCANS_FILE.read_text())

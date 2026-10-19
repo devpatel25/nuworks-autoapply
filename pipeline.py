@@ -24,7 +24,9 @@ Usage:
 """
 import os
 import sys
+import atexit
 import csv
+import html
 import json
 import time
 import uuid
@@ -35,7 +37,7 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, date
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import apply_type
 import auto_apply
@@ -47,6 +49,7 @@ import claude_runner
 import stats
 import resume_agents as ra
 import telegram_bot as tg
+import events
 
 # external_autofill loads its OWN copy of telegram_bot by file path (so wellfound can
 # share it). Inside this pipeline it must use the shared module instead — otherwise
@@ -100,12 +103,12 @@ APPROVAL_TIMEOUT = 3600  # 1 hour
 SCRAPE_TIMEOUT  = 900                                                  # hard kill for the scrape subprocess (login + DUO up to 10 min + scrape)
 SCRAPE_BUDGET   = SCRAPE_TIMEOUT + 120                                  # watchdog must OUTLAST the subprocess timeout, so the graceful killpg path wins instead of os._exit (which orphans the browser — the 06-10 10:29 trip)
 # Tailoring runs up to max_total_attempts() (Sonnet phase + Opus escalation phase),
-# each up to DEFAULT_TIMEOUT, with capped linear backoff between regenerations +
+# each up to tailor.GEN_TIMEOUT (any attempt can be a fresh generation), with capped linear backoff between regenerations +
 # pdflatex time. The budget must cover that real worst case or the watchdog hard-
 # kills a healthy-but-slow tailor that's legitimately escalating to Opus (H2).
 _TAILOR_ATTEMPTS = tailor.max_total_attempts()
 _TAILOR_BACKOFF  = claude_runner.DEFAULT_BACKOFF * sum(min(i, 4) for i in range(1, _TAILOR_ATTEMPTS))
-TAILOR_BUDGET   = _TAILOR_ATTEMPTS * claude_runner.DEFAULT_TIMEOUT + _TAILOR_BACKOFF + 300
+TAILOR_BUDGET   = _TAILOR_ATTEMPTS * max(tailor.GEN_TIMEOUT, claude_runner.DEFAULT_TIMEOUT) + _TAILOR_BACKOFF + 300
 APPLY_BUDGET    = 300                                                  # one portal apply
 
 # How many resumes to tailor concurrently up front (the slow claude -p calls).
@@ -208,6 +211,55 @@ def already_ran_today() -> bool:
 
 def mark_ran_today():
     RUN_STAMP.write_text(date.today().isoformat())
+
+
+def _kill_tree():
+    """SIGKILL every descendant of this process. Walks the ps tree instead of
+    killpg because scrape() and claude -p run in their own sessions."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    kids = {}
+    for line in out.splitlines():
+        pid, ppid = map(int, line.split())
+        kids.setdefault(ppid, []).append(pid)
+    todo, tree = [os.getpid()], []
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            tree.append(c)
+            todo.append(c)
+    for pid in tree:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _on_command(cmd: str):
+    """Telegram /start, /stop or /apply <id> sent while this run is live (control_bot.py
+    handles them when no run is). Anything else is ignored — never the kill path."""
+    verb, _, arg = cmd.partition(" ")
+    if verb == "/start":
+        tg.send_message("▶️ NUworks run is already in progress. Send /stop to kill it.")
+        return
+    if verb == "/apply":
+        if not arg:
+            tg.send_message(tg.APPLY_USAGE)
+        elif _submit_manual(arg):
+            tg.send_message("📥 Fetching posting…")
+        else:  # main() is past the join point — hand it to the next (idle) run
+            tg.queue_apply(arg)
+            tg.send_message("📥 This run is wrapping up — queued, a new run will pick it up.")
+        return
+    if verb != "/stop":
+        return
+    log("Telegram /stop — killing run and marking today done.")
+    mark_ran_today()
+    try:  # best-effort: a Telegram outage must never keep the run alive
+        tg._commit_offset(tg.DISPATCHER.offset)  # so the listener doesn't replay /stop
+        tg.send_message("🛑 NUworks run stopped. It won't run again today — send /start to rerun.")
+    except Exception as e:
+        log(f"  /stop ack failed ({type(e).__name__}: {e}) — killing anyway")
+    _kill_tree()
+    os._exit(0)
 
 
 # Jobs the user didn't decide on in time (approval timed out). Re-queued on the
@@ -349,14 +401,15 @@ def scrape():
         raise subprocess.CalledProcessError(rc, "job_scraper.py")
 
 
-def scrape_with_duo_retry() -> bool:
+def scrape_with_duo_retry(mark_skip: bool = True) -> bool:
     """Run the scrape; if the DUO push isn't approved in the scraper's window, ask
     the user (Telegram, two inline buttons) whether to resend the push and try
     again now, or skip for today — and act on the tap. Loops so the user can rerun
     as many times as they like (each rerun is a fresh login + push + scrape).
 
     Returns True if the scrape succeeded (proceed with the run), or False if the
-    run should stop here (skip / no response / a non-DUO failure)."""
+    run should stop here (skip / no response / a non-DUO failure). mark_skip=False
+    (manual /apply) keeps a "skip" from consuming today's scheduled run."""
     while True:
         try:
             scrape()
@@ -381,6 +434,9 @@ def scrape_with_duo_retry() -> bool:
                 bump_watchdog(SCRAPE_BUDGET)
                 continue  # loop back and re-scrape (fresh login + push)
             if choice == "skip":
+                if not mark_skip:
+                    tg.send_message("⏭️ Skipped the DUO retry — that posting wasn't loaded.")
+                    return False
                 mark_ran_today()  # explicit skip → don't fire again today
                 tg.send_message("⏭️ Skipped today's NUworks run as requested. "
                                 "I won't prompt for DUO again until tomorrow.")
@@ -602,16 +658,26 @@ def _limit_reset() -> tuple:
         if not cursor:
             break
     # Undated rows can't be ordered by age → never deleted.
-    oldest = sorted((x for x in scans if x.get("scanned_at")),
-                    key=lambda x: x["scanned_at"])[:n]
-    deleted = 0
+    oldest = sorted((x for x in scans if x.get("scanned_at")), key=lambda x: x["scanned_at"])
+    deleted = refused = 0
     for x in oldest:
+        if deleted >= n:
+            break
         r = _bi("delete", scan_id=x["scan_id"])
         if not r.get("ok"):
+            e = r.get("error") or {}
+            # The MCP refuses (before touching the site) to delete the latest loop
+            # result without confirm=true. Never force it — that result may back an
+            # open card; skip to the next oldest instead.
+            if e.get("code") == "invalid_input" and "confirm" in (e.get("hint") or ""):
+                refused += 1
+                continue
             _msg(_bi_err("delete", r))
             break
         deleted += 1
-    log(f"  scan limit reset: deleted {deleted}/{len(oldest)} oldest scan(s)")
+    log(f"  scan limit reset: deleted {deleted}/{n} oldest scan(s), {refused} refused as latest")
+    if not deleted and refused:
+        SCAN_RESET_STAMP.unlink(missing_ok=True)  # nothing was deleted: don't burn today's reset
     a = _bi("auth")
     left = ((a.get("data") or {}).get("scans_remaining") if a.get("ok") else None) or 0
     if left > 0:
@@ -746,6 +812,7 @@ def _scan_and_retailor(job: dict, ctx: dict, st: dict):
         _msg(f"⚠️ Retailored v{res['version']} failed the post-check "
              f"({', '.join(post.get('failed', []))}) — here is v{n} again.")
         return st
+    (Path(new["pdf"]).parent / tailor.VALIDATED).touch()  # retry may now restore it
     return new
 
 
@@ -795,7 +862,7 @@ def _run_job(job: dict, ctx: dict, dry_apply: bool) -> dict:
     if existing:
         log(f"  [{title}] using existing tailored resume: {Path(existing).name}")
         res = {"ok": True, "pdf": existing, "tex": existing[:-4] + ".tex",
-               "attempts": 0, "model": "reused", "version": 1}
+               "attempts": 0, "model": "reused", "version": tailor.version_of(existing)}
     else:
         bump_watchdog(HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
         with LLM_SLOTS:
@@ -809,7 +876,9 @@ def _run_job(job: dict, ctx: dict, dry_apply: bool) -> dict:
         return _result(job, "tailor_failed", system_failure=True)
 
     # Steps 9–10: post-check + verdict.
-    st, post = _resume_state(job, ctx, res, match, kwpass, 1, 0, "")
+    # Each successful retailor is +1 version and +1 round, so a reused vN is round N-1.
+    v = res.get("version", 1)
+    st, post = _resume_state(job, ctx, res, match, kwpass, v, v - 1, "")
     if st is None:
         # Quarantine so tailor.latest_pdf() (glob Resume_*.pdf) won't reuse it next run.
         bad = Path(res["pdf"])
@@ -957,51 +1026,171 @@ def _crash_result(job: dict, e: Exception) -> dict:
 
 def _posting_worker(job: dict, nonce: str, ctx: dict, dry_apply: bool) -> dict:
     """Wait on ONE posting card; an Approve starts that job's pipeline right away."""
-    dec = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=POSTING_TIMEOUT)
-    log(f"JOB: {job.get('title', '')[:55]} ({job.get('company', '')})  posting decision: {dec}")
-    if dec == "approve":
-        try:
-            return _run_job(job, ctx, dry_apply)
-        except Exception as e:
-            return _crash_result(job, e)
-    if dec == "timeout":
-        add_pending(job, "transient", "no posting-approval tap in time")
-        return _result(job, "timeout")
-    clear_pending(job["job_id"])
-    add_to_skiplist(job["job_id"])
-    return _result(job, dec)
+    try:
+        dec = tg.wait_for_decision(job["job_id"], nonce=nonce, timeout=POSTING_TIMEOUT)
+        log(f"JOB: {job.get('title', '')[:55]} ({job.get('company', '')})  posting decision: {dec}")
+        if dec == "approve":
+            try:
+                return _run_job(job, ctx, dry_apply)
+            except Exception as e:
+                return _crash_result(job, e)
+        if dec == "timeout":
+            add_pending(job, "transient", "no posting-approval tap in time")
+            return _result(job, "timeout")
+        clear_pending(job["job_id"])
+        if not job.get("_manual"):  # a hand-picked posting isn't a verdict on the posting
+            add_to_skiplist(job["job_id"])
+        return _result(job, dec)
+    finally:
+        with _active_lock:
+            _active_ids.discard(job["job_id"])
 
 
 def run_postings(todo: list, ctx: dict, dry_apply: bool) -> list:
     """Step 4 + per-job workers: send EVERY posting card at once, then each card's
     Approve starts Steps 5–14 for that job immediately, in parallel (plan §5)."""
     results = []
+    started = not tg.DISPATCHER.running  # main() may already own it for the whole run
     tg.DISPATCHER.start()
     try:
         bump_watchdog(POSTING_TIMEOUT + HYBRID_BUDGET + APPROVAL_TIMEOUT
                       + APPLY_BUDGET * max(1, len(todo)) + 300)
-        sent = []
-        for job in todo:
-            nonce = uuid.uuid4().hex[:8]
-            try:
-                tg.send_job_for_approval(job, nonce=nonce)
-                sent.append((job, nonce))
-            except Exception as e:
-                log(f"  posting card send failed for {job.get('title', '')[:50]}: {e}")
-                add_pending(job, "transient", "posting card send failed")
-                results.append(_result(job, "timeout", detail="posting card send failed"))
-        log(f"sent {len(sent)} posting card(s)")
-        if sent:
-            with ThreadPoolExecutor(max_workers=len(sent)) as ex:
-                futs = {ex.submit(_posting_worker, j, n, ctx, dry_apply): j for j, n in sent}
-                for fut in as_completed(futs):
-                    try:
-                        results.append(fut.result())
-                    except Exception as e:
-                        results.append(_crash_result(futs[fut], e))
+        futs = {}
+        with ThreadPoolExecutor(max_workers=max(1, len(todo))) as ex:
+            for job in todo:
+                nonce = uuid.uuid4().hex[:8]
+                with _active_lock:  # a /apply may already own this posting
+                    if job["job_id"] in _active_ids:
+                        log(f"  skip {job.get('title', '')[:50]}: already has a card (/apply)")
+                        continue
+                    _active_ids.add(job["job_id"])
+                try:
+                    tg.send_job_for_approval(job, nonce=nonce)
+                except Exception as e:
+                    with _active_lock:
+                        _active_ids.discard(job["job_id"])
+                    log(f"  posting card send failed for {job.get('title', '')[:50]}: {e}")
+                    add_pending(job, "transient", "posting card send failed")
+                    results.append(_result(job, "timeout", detail="posting card send failed"))
+                    continue
+                # start the worker now so an early Approve doesn't wait on later sends
+                futs[ex.submit(_posting_worker, job, nonce, ctx, dry_apply)] = job
+            log(f"sent {len(futs)} posting card(s)")
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    results.append(_crash_result(futs[fut], e))
     finally:
-        tg.DISPATCHER.stop()
+        if started:
+            tg.DISPATCHER.stop()
     return results
+
+
+_active_ids: set = set()        # job_ids with a live posting card this run
+_active_lock = threading.Lock()
+_ctx_lock = threading.Lock()
+_ctx_cache: dict = {}           # {"v": ctx|None} — one base-resume audit per run
+_scrape_lock = threading.Lock() # one scrape/DUO login at a time (main's vs a manual job's)
+_manual_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="manual")
+_manual_futs: list = []
+_manual_lock = threading.Lock()
+_closing = False                # main() is past the join point: no new manual jobs
+_dry_apply = False              # set by main() so manual jobs honor --dry-apply
+
+
+def _get_ctx() -> dict | None:
+    """audit_or_stop() once per run, shared by run_postings and manual jobs."""
+    with _ctx_lock:
+        if "v" not in _ctx_cache:
+            _ctx_cache["v"] = audit_or_stop()
+        return _ctx_cache["v"]
+
+
+def _submit_manual(job_id: str) -> bool:
+    """Queue a /apply job into this run; False once main() has closed the join."""
+    with _manual_lock:
+        if _closing:
+            return False
+        _manual_futs.append(_manual_pool.submit(_manual_job, job_id))
+        return True
+
+
+def _join_manual() -> list:
+    """Wait for manual jobs; the run stays open to new /apply until none is in flight,
+    then closes (late ones go to the queue file for the next run)."""
+    global _closing
+    out, seen = [], 0
+    while True:
+        with _manual_lock:
+            todo = _manual_futs[seen:]
+            if not todo:
+                _closing = True
+                return out
+        seen += len(todo)
+        wait(todo)
+        for f in todo:
+            try:
+                r = f.result()
+            except Exception as e:
+                log(f"  manual job crashed: {type(e).__name__}: {e}")
+                continue
+            if r:
+                out.append(r)
+
+
+def _manual_job(job_id: str) -> dict | None:
+    """/apply <id>: one hand-picked posting through the normal card → tailor → apply
+    flow. Returns a result for the summary/supervisor, or None when nothing was
+    attempted (couldn't load, duplicate card, base resume red)."""
+    claimed = False
+    try:
+        bump_watchdog(POSTING_TIMEOUT + HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET + 300)
+        url = tg.job_posting_url(job_id)
+        job = apply_type.fetch_job(job_id)
+        if job is None:  # expired session or bad id — one DUO re-login, then retry
+            with _scrape_lock:
+                job = apply_type.fetch_job(job_id)  # a scrape we waited on may have fixed it
+                if job is None and scrape_with_duo_retry(mark_skip=False):
+                    job = apply_type.fetch_job(job_id)
+        if job is None:
+            _msg(f"❌ Couldn't load posting {job_id}\n{url}")
+            return None
+        kind = job["_apply_type"]
+        if kind != "in_portal":
+            target = job.get("_apply_target")
+            _msg(f"ℹ️ Can't auto-apply to <b>{html.escape(job['title'][:80])}</b>: {kind}"
+                 + (f" → {html.escape(str(target))}" if target else "") + f"\n{url}")
+            return _result(job, {"already_applied": "already_applied",
+                                 "external": "external"}.get(kind, "no_inportal_apply"))
+        with _active_lock:
+            dup = job_id in _active_ids
+            if not dup:
+                _active_ids.add(job_id)
+                claimed = True
+        if dup:
+            _msg("⏳ That posting already has a card in this run — see above.")
+            return None
+        job["_manual"] = True
+        ctx = _get_ctx()
+        if ctx is None:
+            return None  # audit_or_stop already alerted
+        nonce = uuid.uuid4().hex[:8]
+        try:
+            tg.send_job_for_approval(job, nonce=nonce)
+        except Exception as e:
+            log(f"  posting card send failed for {job.get('title', '')[:50]}: {e}")
+            add_pending(job, "transient", "posting card send failed")
+            return _result(job, "timeout", detail="posting card send failed")
+        return _posting_worker(job, nonce, ctx, _dry_apply)  # releases the claim itself
+    except Exception as e:
+        log(f"  /apply {job_id[:8]} failed: {type(e).__name__}: {e}")
+        _msg(f"⚠️ /apply failed: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:200])}</code>")
+        return None
+    finally:
+        if claimed:
+            with _active_lock:
+                _active_ids.discard(job_id)
 
 
 def audit_or_stop() -> dict | None:
@@ -1026,10 +1215,12 @@ def audit_or_stop() -> dict | None:
 
 
 def main():
+    global _dry_apply
     args = sys.argv[1:]
     do_scrape = "--no-scrape" not in args
     dry_apply = "--dry-apply" in args
     force = "--force" in args
+    _dry_apply = dry_apply
     limit = None
     if "--limit" in args:
         limit = int(args[args.index("--limit") + 1])
@@ -1049,10 +1240,18 @@ def main():
         log("Another pipeline run is already active (lock held) — exiting.")
         return
 
+    # /apply postings queued by control_bot. Manual mode (just those jobs: no scrape or
+    # scheduled queue, today's scheduled run stays open) only when an /apply started this
+    # run (flag) or the day is already done; otherwise they ride along with a normal run.
+    queued = tg.drain_apply_queue() if tg.configured() else []
+    flagged = tg.MANUAL_FLAG.exists()
+    tg.MANUAL_FLAG.unlink(missing_ok=True)
+    manual_mode = bool(queued) and (flagged or (already_ran_today() and not force))
+
     # Once-per-day guard: the LaunchAgent fires at 10:00 AND on every login
     # (RunAtLoad), so a run missed while the Mac was off catches up at next
     # power-on — but only the first run of the day actually proceeds.
-    if already_ran_today() and not force:
+    if not manual_mode and already_ran_today() and not force:
         log("Already ran today — skipping (use --force to override).")
         return
 
@@ -1060,22 +1259,43 @@ def main():
     # deadline is extended phase-by-phase as we go; if it's ever passed the run
     # is aborted WITHOUT marking the day, so it retries live on next login.
     _start_watchdog(SCRAPE_BUDGET)
+    events.instrument(sys.modules[__name__])  # live trace for the pipeline-live pane
 
-    if do_scrape and not scrape_with_duo_retry():
-        return  # skipped / no response / non-DUO failure — stop here
+    # Own getUpdates for the whole run so Telegram /stop works in every phase
+    # (scrape, DUO wait, tailoring, apply). control_bot.py yields while we hold the lock.
+    if tg.configured():
+        tg.DISPATCHER.on_command = _on_command
+        tg.DISPATCHER.start()
+        atexit.register(tg.DISPATCHER.stop)
 
-    bump_watchdog(180)  # classification / parsing headroom
+    for jid in queued:
+        _submit_manual(jid)
+    if manual_mode:
+        log(f"Manual mode: {len(queued)} queued /apply posting(s) — skipping scrape and the "
+            "scheduled queue; today's scheduled run stays open.")
+        jobs, todo = [], []
+    else:
+        if queued:
+            log(f"{len(queued)} queued /apply posting(s) join this run.")
+        if do_scrape:
+            with _scrape_lock:
+                scraped = scrape_with_duo_retry()
+            if not scraped:
+                _join_manual()  # a mid-run /apply may already hold a card
+                return  # skipped / no response / non-DUO failure — stop here
 
-    jobs = load_jobs()
-    log(f"Loaded {len(jobs)} jobs from CSV")
+        bump_watchdog(180)  # classification / parsing headroom
 
-    todo = eligible(jobs)  # also classifies every job (sets _apply_type) for the alert
-    # Heads-up on freshly-found postings (title/company/type), deduped across slots.
-    stats.announce_new_postings(jobs)
-    todo = merge_pending(todo)  # re-add jobs whose approval timed out previously (H5)
-    if limit:
-        todo = todo[:limit]
-    log(f"{len(todo)} in-portal jobs to process")
+        jobs = load_jobs()
+        log(f"Loaded {len(jobs)} jobs from CSV")
+
+        todo = eligible(jobs)  # also classifies every job (sets _apply_type) for the alert
+        # Heads-up on freshly-found postings (title/company/type), deduped across slots.
+        stats.announce_new_postings(jobs)
+        todo = merge_pending(todo)  # re-add jobs whose approval timed out previously (H5)
+        if limit:
+            todo = todo[:limit]
+        log(f"{len(todo)} in-portal jobs to process")
 
     # Step 3–14: no LLM sees a JD before its posting Approve. Without Telegram there
     # is no human gate, so nothing is tailored at all.
@@ -1085,10 +1305,14 @@ def main():
         log("  ⚠ Telegram not configured — cannot ask for posting approval; nothing tailored.")
         results = [_result(j, "no_telegram") for j in todo]
     else:
-        ctx = audit_or_stop()
+        ctx = _get_ctx()
         if ctx is None:
+            _join_manual()
             return  # base resume red → alert sent, day unmarked
         results = run_postings(todo, ctx, dry_apply)
+
+    # Mid-run /apply jobs (and manual mode's own) join this run's summary.
+    results += _join_manual()
 
     log("=" * 55)
     log("SUMMARY:")
@@ -1099,7 +1323,12 @@ def main():
     # cover-letter / apply step broke, leave today unmarked so the run re-fires
     # live next login (the user can then watch where it breaks).
     failures = [r for r in results if r.get("system_failure")]
-    if failures:
+    marked = not failures and not manual_mode
+    if manual_mode:
+        log("Manual run — today's scheduled run left open (not marked).")
+        if not results:
+            return
+    elif failures:
         log(f"{len(failures)} system failure(s) — leaving today UNMARKED so the run "
             "retries live on next login.")
     else:
@@ -1107,7 +1336,7 @@ def main():
         log("Run clean — marked as done for today.")
 
     # Record this run's outcomes for the nightly digest (best-effort).
-    stats.record_run(jobs, results, marked=not failures)
+    stats.record_run(jobs, results, marked=marked)
 
     # Supervisor: classify every outcome, break doomed retry loops (evict un-satisfiable
     # jobs to data/wontfix.json so eligible()/merge_pending() stop re-offering them), and
@@ -1116,7 +1345,7 @@ def main():
     # wrapped so a supervisor error never fails the run. Brain stays OFF for this port.
     try:
         import supervisor
-        supervisor.run_supervisor(results, marked=not failures, use_brain=False)
+        supervisor.run_supervisor(results, marked=marked, use_brain=False)
     except Exception as e:
         log(f"supervisor hook error (run still completed): {type(e).__name__}: {e}")
 

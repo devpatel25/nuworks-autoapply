@@ -10,6 +10,7 @@ data/*
 resume_templates/Resume_SWE_General.tex
 resume_templates/Resume_AI-ML_General.tex
 resume_templates/memory.txt
+resume_templates/project_bank.md
 
 # ── Generated outputs (regenerated each run; personal) ───────────────────────
 documents/
@@ -27,3 +28,11 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# pdflatex artifacts from compiling the base templates by hand — showed up in claude -p git status
+# and lured the tailor into reading resume_templates/ (denied → no output, 2026-10-15)
+resume_templates/*.aux
+resume_templates/*.log
+resume_templates/*.out
+resume_templates/*.pdf
+resume_templates/*.synctex.gz
