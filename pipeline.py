@@ -658,16 +658,26 @@ def _limit_reset() -> tuple:
         if not cursor:
             break
     # Undated rows can't be ordered by age → never deleted.
-    oldest = sorted((x for x in scans if x.get("scanned_at")),
-                    key=lambda x: x["scanned_at"])[:n]
-    deleted = 0
+    oldest = sorted((x for x in scans if x.get("scanned_at")), key=lambda x: x["scanned_at"])
+    deleted = refused = 0
     for x in oldest:
+        if deleted >= n:
+            break
         r = _bi("delete", scan_id=x["scan_id"])
         if not r.get("ok"):
+            e = r.get("error") or {}
+            # The MCP refuses (before touching the site) to delete the latest loop
+            # result without confirm=true. Never force it — that result may back an
+            # open card; skip to the next oldest instead.
+            if e.get("code") == "invalid_input" and "confirm" in (e.get("hint") or ""):
+                refused += 1
+                continue
             _msg(_bi_err("delete", r))
             break
         deleted += 1
-    log(f"  scan limit reset: deleted {deleted}/{len(oldest)} oldest scan(s)")
+    log(f"  scan limit reset: deleted {deleted}/{n} oldest scan(s), {refused} refused as latest")
+    if not deleted and refused:
+        SCAN_RESET_STAMP.unlink(missing_ok=True)  # nothing was deleted: don't burn today's reset
     a = _bi("auth")
     left = ((a.get("data") or {}).get("scans_remaining") if a.get("ok") else None) or 0
     if left > 0:
@@ -802,6 +812,7 @@ def _scan_and_retailor(job: dict, ctx: dict, st: dict):
         _msg(f"⚠️ Retailored v{res['version']} failed the post-check "
              f"({', '.join(post.get('failed', []))}) — here is v{n} again.")
         return st
+    (Path(new["pdf"]).parent / tailor.VALIDATED).touch()  # retry may now restore it
     return new
 
 
@@ -851,7 +862,7 @@ def _run_job(job: dict, ctx: dict, dry_apply: bool) -> dict:
     if existing:
         log(f"  [{title}] using existing tailored resume: {Path(existing).name}")
         res = {"ok": True, "pdf": existing, "tex": existing[:-4] + ".tex",
-               "attempts": 0, "model": "reused", "version": 1}
+               "attempts": 0, "model": "reused", "version": tailor.version_of(existing)}
     else:
         bump_watchdog(HYBRID_BUDGET + APPROVAL_TIMEOUT + APPLY_BUDGET)
         with LLM_SLOTS:
@@ -865,7 +876,9 @@ def _run_job(job: dict, ctx: dict, dry_apply: bool) -> dict:
         return _result(job, "tailor_failed", system_failure=True)
 
     # Steps 9–10: post-check + verdict.
-    st, post = _resume_state(job, ctx, res, match, kwpass, 1, 0, "")
+    # Each successful retailor is +1 version and +1 round, so a reused vN is round N-1.
+    v = res.get("version", 1)
+    st, post = _resume_state(job, ctx, res, match, kwpass, v, v - 1, "")
     if st is None:
         # Quarantine so tailor.latest_pdf() (glob Resume_*.pdf) won't reuse it next run.
         bad = Path(res["pdf"])
