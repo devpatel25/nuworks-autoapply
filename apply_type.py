@@ -93,7 +93,10 @@ async def _fetch_job(job_id: str) -> dict:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
-            ctx = await browser.new_context(storage_state=SESSION)
+            try:
+                ctx = await browser.new_context(storage_state=SESSION)
+            except (OSError, ValueError, PWError):  # session.json missing/corrupt: same as expired
+                return {}
             page = await ctx.new_page()
             await page.goto(PORTAL, wait_until="domcontentloaded", timeout=30000)
             try:

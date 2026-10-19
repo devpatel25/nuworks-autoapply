@@ -711,6 +711,17 @@ class TestScoreCard(unittest.TestCase):
         c.toggle(cq("tg"), 2); c.toggle(cq("tg"), 0)
         self.assertEqual(c.picked(), (["Kubernetes"], ["Quantify impact"]))
 
+    def test_long_corrections_listed_in_full_and_numbered(self):
+        fb = json.loads(json.dumps(FB))
+        long = "Quantify the impact of the RAG evaluation pipeline with latency and accuracy numbers"
+        fb["action_items"].append({"category": "credibility", "item": long})
+        c = TB.ScoreCard(JOB, "n", fb)
+        n = [i["text"] for i in c.selectable].index(long) + 1
+        self.assertIn(f"{n}. ✎ {long}", c.text())
+        btn = c.keyboard()["inline_keyboard"][n - 1][0]["text"]
+        self.assertTrue(btn.startswith(f"☐ {n}. ✎ "))
+        self.assertLess(len(btn), len(long))  # button stays truncated; message has it all
+
     def test_overflow_over_20(self):
         fb = json.loads(json.dumps(FB))
         fb["categories"]["ats_fit"]["keywords_unmatched"] = [f"kw{i}" for i in range(25)]
