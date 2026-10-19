@@ -406,6 +406,9 @@ def header_location(job: dict) -> str:
     return loc
 
 
+VALIDATED = ".validated"  # marker in <workdir>/vN/ once vN passed the post-check
+
+
 def version_of(tex) -> int:
     """v1 lives in the job workdir; retailored versions in <workdir>/vN/."""
     m = re.fullmatch(r"v(\d+)", Path(tex).parent.name)
@@ -500,8 +503,13 @@ def consolidate(pdf: Path, tex: Path | None = None) -> str:
 def latest_pdf(job: dict) -> str | None:
     """Find an already-produced tailored PDF for this job to reuse. Only returns a
     PDF that is EXACTLY one page — a leftover 2-page PDF from a failed page_overflow
-    attempt must never be reused (it would skip tailoring and ship a 2-page resume)."""
-    matches = sorted(APPS.glob(f"*/{job['job_id'][:8]}/Resume_*.pdf"))
+    attempt must never be reused (it would skip tailoring and ship a 2-page resume).
+    Retailored vN/ PDFs count only once they passed the post-check (VALIDATED marker),
+    so a retry restores the newest validated version, not v1."""
+    jid = job['job_id'][:8]
+    matches = list(APPS.glob(f"*/{jid}/Resume_*.pdf")) + [
+        p for p in APPS.glob(f"*/{jid}/v*/Resume_*.pdf") if (p.parent / VALIDATED).exists()]
+    matches.sort(key=lambda p: (p.relative_to(APPS).parts[0], version_of(p), p.name))
     for p in reversed(matches):
         try:
             out = subprocess.run(["pdfinfo", str(p)], capture_output=True, text=True).stdout

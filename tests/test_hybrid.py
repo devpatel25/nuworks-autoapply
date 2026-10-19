@@ -497,6 +497,18 @@ class TestRetailor(TailorBase):
         for loc in ("Multiple Locations", "", "Remote"):
             self.assertIn("unchanged", T.header_location({"location": loc}))
 
+    def test_latest_pdf_restores_newest_validated_version(self):
+        for v in ("v2", "v3"):
+            (self.d / v).mkdir()
+            (self.d / v / "Resume_MLIntern_Foo.pdf").write_bytes(b"%PDF")
+        (self.d / "Resume_MLIntern_Foo.pdf").write_bytes(b"%PDF")
+        (self.d / "v2" / T.VALIDATED).touch()     # v3 never passed the post-check
+        one = unittest.mock.Mock(stdout="Pages:          1\n")
+        with patch.object(T.subprocess, "run", return_value=one):
+            got = T.latest_pdf(self.job)
+        self.assertEqual(Path(got), self.d / "v2" / "Resume_MLIntern_Foo.pdf")
+        self.assertEqual(T.version_of(got), 2)
+
     def test_nothing_picked(self):
         with patch.object(T.claude_runner, "run_claude_p") as cl:
             r = T.retailor(self.job, self.v1, [], [])
@@ -1141,6 +1153,34 @@ class TestLimitReset(PipeBase):
         self.assertIn("already ran", msg2)
         self.assertEqual(bi.calls.count("delete"), 5)            # second call deleted nothing
 
+    def test_latest_refusal_skipped_and_does_not_burn_stamp(self):
+        refuse = env(err={"code": "invalid_input", "message": "latest loop result",
+                          "hint": "Pass confirm=true to delete it anyway."})
+        # Only refusals → nothing deleted, today's reset stays available.
+        bi = FakeBI({"list": env({"scans": self.SCANS[:1], "next_cursor": None}),
+                     "delete": refuse, "auth": env({"logged_in": True, "scans_remaining": 0})})
+        with patch.object(P, "_bi", bi):
+            ok, _, _ = P._limit_reset()
+        self.assertFalse(ok)
+        self.assertFalse(P.SCAN_RESET_STAMP.exists())
+        # A refused latest is skipped (never forced), the next oldest still deleted.
+        deleted = []
+
+        def bi2(cmd, **kw):
+            if cmd == "delete":
+                self.assertNotIn("confirm", kw)
+                if kw["scan_id"] == "s7":
+                    return refuse
+                deleted.append(kw["scan_id"])
+                return env({"deleted": True})
+            return self.bi(True)(cmd, **kw)
+
+        with patch.object(P, "_bi", bi2):
+            ok, _, left = P._limit_reset()
+        self.assertTrue(ok)
+        self.assertEqual(deleted, ["s6", "s5", "s4", "s3", "s2"])
+        self.assertTrue(P.SCAN_RESET_STAMP.exists())
+
 
 class TestRetailorFlow(PipeBase):
     ST = TestScan.ST
@@ -1170,7 +1210,7 @@ class TestRetailorFlow(PipeBase):
     def test_retailor_success_new_version_and_round(self):
         tex = self.tmp / "r.tex"; tex.write_text("x")
         st = {**self.ST, "tex": str(tex)}
-        new_res = {"ok": True, "pdf": "/v2.pdf", "tex": str(tex), "version": 2, "attempts": 1,
+        new_res = {"ok": True, "pdf": str(self.tmp / "v2.pdf"), "tex": str(tex), "version": 2, "attempts": 1,
                    "model": "claude-sonnet-4-6"}
         fb = {"scan_id": "s", "medal": "silver", "categories": {"ats_fit": {"badge": "bronze"}}}
         with patch.object(P, "_run_scan", return_value=(fb, 2, None)), self.card_patch(), \
@@ -1179,6 +1219,7 @@ class TestRetailorFlow(PipeBase):
              patch.object(P.ra, "verify_tailored_pdf", return_value={"ok": True, "notes": [], "failed": []}):
             out = P._scan_and_retailor(self.job, {"audit": {}, "base_texts": {}}, st)
         self.assertEqual((out["version"], out["round"]), (2, 1))
+        self.assertTrue((self.tmp / T.VALIDATED).exists())          # retry may restore v2
         self.assertEqual(out["prev_scan"], "🥈 Silver · ATS Fit: 🥉 Bronze")
         self.assertEqual(rt.call_args.args[2:], (["Kubernetes"], []))   # only ticked items
         rows = json.loads(P.SCANS_FILE.read_text())
