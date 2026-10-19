@@ -158,6 +158,16 @@ class TestControlBotIdle(unittest.TestCase):
         self.assertEqual(TB.drain_apply_queue(), [])
         self.assertFalse(self.stamp.exists())  # unknown must not fall into the /stop branch
 
+    def test_run_taking_lock_mid_batch_leaves_rest_unconfirmed(self):
+        ups = [{"update_id": 7, "message": {}}, {"update_id": 8, "message": {}}]
+        running = iter([False, True])  # the run grabs the lock after update 7
+        with patch.object(CB, "pipeline_running", lambda: next(running)), \
+                patch.object(TB, "parse_command", lambda u: "/stop"), \
+                patch.object(CB, "handle") as h:
+            offset, handed = CB.drain(ups, None)
+        self.assertEqual((offset, handed), (8, True))  # 8 (the /stop) stays for the run
+        h.assert_called_once_with("/stop")
+
 
 if __name__ == "__main__":
     unittest.main()

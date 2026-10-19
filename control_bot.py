@@ -82,6 +82,29 @@ def handle(cmd: str):
                         "scheduled runs — send /start to run now.")
 
 
+def drain(updates: list, offset):
+    """Handle a getUpdates batch; returns (offset to confirm, handed_off). A run can
+    take the lock while our poll was in flight: from then on the batch is left
+    unconfirmed so the pipeline's dispatcher (which starts at offset None) receives
+    it — e.g. a /stop meant for that run is never swallowed here."""
+    # ponytail: per-update lock check; a run starting mid-handle() is still a ms-wide window
+    for upd in updates:
+        if pipeline_running():
+            return offset, True
+        offset = upd["update_id"] + 1
+        cq = upd.get("callback_query")
+        if cq:
+            tg.answer_callback(cq["id"], "This card is no longer active.")
+        cmd = tg.parse_command(upd)
+        if cmd:
+            try:
+                handle(cmd)
+            except Exception as e:
+                print(f"{cmd} failed: {e}", flush=True)
+                tg.send_message(f"⚠️ {cmd} failed: {e}")
+    return offset, False
+
+
 def main():
     tg._require()
     requests.post(f"{tg.API}/setMyCommands", json={"commands": [
@@ -110,19 +133,11 @@ def main():
         except (requests.RequestException, ValueError):
             time.sleep(5)
             continue
-        for upd in r.get("result", []):
-            offset = upd["update_id"] + 1
-            cq = upd.get("callback_query")
-            if cq:
-                tg.answer_callback(cq["id"], "This card is no longer active.")
-            cmd = tg.parse_command(upd)
-            if cmd:
-                try:
-                    handle(cmd)
-                except Exception as e:
-                    print(f"{cmd} failed: {e}", flush=True)
-                    tg.send_message(f"⚠️ {cmd} failed: {e}")
+        offset, handed_off = drain(r.get("result", []), offset)
         tg._commit_offset(offset)  # confirm now, so a run starting next never replays these
+        if handed_off:
+            offset = None
+            continue
         if not r.get("ok", True):
             time.sleep(5)  # 409 while the pipeline's poller hands back
 
