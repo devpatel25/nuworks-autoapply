@@ -814,6 +814,19 @@ import threading  # noqa: E402
 import pipeline as P  # noqa: E402
 
 
+_REAL_LOG_DIR = P.LOG_DIR
+
+
+def setUpModule():
+    """Keep pipeline.log() out of the real logs/run_<date>.log."""
+    P.LOG_DIR = Path(tempfile.mkdtemp())
+
+
+def tearDownModule():
+    shutil.rmtree(P.LOG_DIR, ignore_errors=True)
+    P.LOG_DIR = _REAL_LOG_DIR
+
+
 class PipeBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

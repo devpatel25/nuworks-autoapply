@@ -468,6 +468,7 @@ class CallbackDispatcher:
         self._stop = threading.Event()
         self._thread = None
         self.offset = None
+        self.on_command = None  # pipeline sets this: handles /start + /stop mid-run
 
     @property
     def running(self) -> bool:
@@ -545,6 +546,12 @@ class CallbackDispatcher:
             return
         for upd in r.get("result", []):
             self.offset = upd["update_id"] + 1
+            cmd = parse_command(upd)
+            if cmd and self.on_command:
+                try:
+                    self.on_command(cmd)
+                except Exception:
+                    pass
             cq = upd.get("callback_query")
             if cq:
                 try:
@@ -576,6 +583,54 @@ class CallbackDispatcher:
 
 
 DISPATCHER = CallbackDispatcher()
+
+COMMANDS = ("/start", "/stop", "/apply")
+COMMAND_MAX_AGE_S = 120  # older commands are replays (e.g. after a crash) — ignore
+JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
+APPLY_QUEUE = Path(__file__).resolve().parent / "data/apply_queue.txt"  # one job_id per line
+# Touched by control_bot when an /apply (not /start or a scheduled slot) starts the run:
+# only then does the pipeline go manual-only. Consumed (unlinked) by pipeline.main.
+MANUAL_FLAG = Path(__file__).resolve().parent / "logs/manual_run.flag"
+_queue_lock = threading.Lock()
+APPLY_USAGE = "Usage: /apply &lt;NUworks posting URL or job id&gt;"
+
+
+def parse_command(upd: dict, now: float = None):
+    """'/start', '/stop', '/apply <job_id>' (bare '/apply' if no id in the text) if
+    this update is a fresh control command from Dev's chat, else None. Only CHAT_ID
+    may drive the pipeline."""
+    msg = upd.get("message") or {}
+    if str((msg.get("chat") or {}).get("id")) != CHAT_ID:
+        return None
+    now = time.time() if now is None else now
+    if now - msg.get("date", 0) > COMMAND_MAX_AGE_S:
+        return None
+    text = (msg.get("text") or "").lower()
+    words = text.split()
+    cmd = words[0].split("@")[0] if words else ""
+    if cmd not in COMMANDS:
+        return None
+    if cmd == "/apply":
+        m = JOB_ID_RE.search(text)
+        return f"/apply {m.group()}" if m else "/apply"
+    return cmd
+
+
+def queue_apply(job_id: str):
+    """Hand a job_id to the next/current pipeline run (both bots share this file)."""
+    # ponytail: append/truncate race across processes is tiny; flock if it ever bites.
+    with _queue_lock, open(APPLY_QUEUE, "a") as f:
+        f.write(job_id + "\n")
+
+
+def drain_apply_queue() -> list[str]:
+    """Pop every queued job_id (deduped, in order); the file is emptied."""
+    with _queue_lock:
+        if not APPLY_QUEUE.exists():
+            return []
+        ids = APPLY_QUEUE.read_text().split()
+        APPLY_QUEUE.write_text("")
+    return list(dict.fromkeys(ids))
 
 
 def _expect(job_id: str, nonce: str):
@@ -700,6 +755,21 @@ def wait_for_duo_decision(nonce: str = "", timeout: int = 3600, poll: int = 3) -
     the spinner clears, and commits the offset so the tap isn't replayed by a later
     run/poller. A tap with a stale nonce is acked + ignored."""
     _require()
+    if DISPATCHER.running:  # it owns getUpdates for the whole run; duo taps key as (nonce, "")
+        q = DISPATCHER.expect(nonce, "")
+        try:
+            while True:
+                try:
+                    action, cq = q.get(timeout=timeout)
+                except queue.Empty:
+                    return "timeout"
+                if action in ("duo_rerun", "duo_skip"):
+                    choice = "rerun" if action == "duo_rerun" else "skip"
+                    answer_callback(cq["id"], "Rerunning… 🔁" if choice == "rerun" else "Skipped ⏭️")
+                    return choice
+                answer_callback(cq["id"], EXPIRED)
+        finally:
+            DISPATCHER.release(nonce, "")
     deadline = time.time() + timeout
     offset = None
     while time.time() < deadline:
