@@ -20,6 +20,8 @@ import time
 import html
 import queue
 import threading
+import fcntl
+import contextlib
 from pathlib import Path
 
 import requests
@@ -333,6 +335,13 @@ class ScoreCard:
             lines += ["", "Feedback incomplete — retailor unavailable for this scan"]
         elif self.selectable and self.round_no < self.max_rounds:
             lines += ["", "Pick what to fix, then Retailor:"]
+            # Full text here — buttons truncate. Capped per item only if 20 long ones
+            # would blow the message limit.
+            cap = max(48, (TEXT_BUDGET - len("\n".join(lines)) - 600) // len(self.selectable))
+            for n, it in enumerate(self.selectable, 1):
+                tag = "" if it["kind"] == "keyword" else "✎ "
+                t = it["text"] if len(it["text"]) <= cap else it["text"][:cap - 1] + "…"
+                lines.append(f"{n}. {tag}{html.escape(t)}")
         if self.overflow:
             lines += ["", "(not selectable — too many):"]
             budget = TEXT_BUDGET - len("\n".join(lines))
@@ -355,7 +364,7 @@ class ScoreCard:
             for i, it in enumerate(self.selectable):
                 box = "☑" if i in self.selected else "☐"
                 tag = "" if it["kind"] == "keyword" else "✎ "
-                rows.append([{"text": f"{box} {tag}{it['text'][:48]}",
+                rows.append([{"text": f"{box} {i + 1}. {tag}{it['text'][:48]}",
                               "callback_data": f"tg:{self.jid}:{self.nonce}:{i}"}])
         last = []
         if self.can_retailor:
@@ -591,8 +600,16 @@ APPLY_QUEUE = Path(__file__).resolve().parent / "data/apply_queue.txt"  # one jo
 # Touched by control_bot when an /apply (not /start or a scheduled slot) starts the run:
 # only then does the pipeline go manual-only. Consumed (unlinked) by pipeline.main.
 MANUAL_FLAG = Path(__file__).resolve().parent / "logs/manual_run.flag"
-_queue_lock = threading.Lock()
 APPLY_USAGE = "Usage: /apply &lt;NUworks posting URL or job id&gt;"
+
+
+@contextlib.contextmanager
+def _queue_lock():
+    """flock on a sidecar file: control_bot appends and the pipeline drains from
+    different processes (and threads — each open() is its own lock holder)."""
+    with open(APPLY_QUEUE.with_suffix(".lock"), "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
 
 
 def parse_command(upd: dict, now: float = None):
@@ -618,14 +635,13 @@ def parse_command(upd: dict, now: float = None):
 
 def queue_apply(job_id: str):
     """Hand a job_id to the next/current pipeline run (both bots share this file)."""
-    # ponytail: append/truncate race across processes is tiny; flock if it ever bites.
-    with _queue_lock, open(APPLY_QUEUE, "a") as f:
+    with _queue_lock(), open(APPLY_QUEUE, "a") as f:
         f.write(job_id + "\n")
 
 
 def drain_apply_queue() -> list[str]:
     """Pop every queued job_id (deduped, in order); the file is emptied."""
-    with _queue_lock:
+    with _queue_lock():
         if not APPLY_QUEUE.exists():
             return []
         ids = APPLY_QUEUE.read_text().split()

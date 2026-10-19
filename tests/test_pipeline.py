@@ -144,6 +144,14 @@ class TestFetchDetail(unittest.TestCase):
         self.assertEqual(self.run_fd(_FakePage(AT.PORTAL, {"job_id": JID})), {"job_id": JID})
         self.assertEqual(self.run_fd(_FakePage(AT.PORTAL, None)), {})
 
+    def test_missing_or_corrupt_session_is_none_so_manual_job_relogs(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "bad.json").write_text("{bad")
+        for f in ("missing.json", "bad.json"):  # real headless launch; returns before any goto
+            with patch.object(AT, "SESSION", str(d / f)):
+                self.assertIsNone(AT.fetch_job(JID), f)
+
 
 class TestManualApply(unittest.TestCase):
     """/apply <id>: command routing, reject semantics, and _manual_job's early exits."""

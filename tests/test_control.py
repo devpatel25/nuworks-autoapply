@@ -72,6 +72,21 @@ class TestApplyQueue(unittest.TestCase):
             self.assertEqual(TB.drain_apply_queue(), ["a" * 32, "b" * 32])
             self.assertEqual(TB.drain_apply_queue(), [])  # drained = emptied
 
+    def test_queue_lock_is_flock_shared_across_processes(self):
+        import fcntl
+        with patch.object(TB, "APPLY_QUEUE", Path(tempfile.mkdtemp()) / "apply_queue.txt"):
+            # Another process holding the flock (a separate open = separate holder).
+            held = open(TB.APPLY_QUEUE.with_suffix(".lock"), "a")
+            fcntl.flock(held, fcntl.LOCK_EX)
+            t = threading.Thread(target=TB.queue_apply, args=("a" * 32,))
+            t.start()
+            t.join(0.3)
+            self.assertTrue(t.is_alive())  # blocked: no append between read and truncate
+            self.assertFalse(TB.APPLY_QUEUE.exists())
+            held.close()  # releases the flock
+            t.join(5)
+            self.assertEqual(TB.drain_apply_queue(), ["a" * 32])
+
 
 class TestDuoViaDispatcher(unittest.TestCase):
     @patch("telegram_bot.answer_callback", lambda *a: None)
